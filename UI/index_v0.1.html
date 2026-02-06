@@ -400,7 +400,7 @@ video { width: 100%; display: block; max-height: 500px; }
     <span class="divider">//</span>
     <a href="{{ url_for('sen') }}" class="mode-link">Sensor Status</a>
     <span class="divider">//</span>
-    <a href="{{ url_for('amb82_analysis') }}" class="mode-link">Field</a>
+    <a href="{{ url_for('amb82_analysis') }}" class="mode-link">Vedio Analysis</a>
 </div>
 
 
@@ -992,6 +992,7 @@ video { width: 100%; display: block; max-height: 500px; }
         
         const formData = new FormData();
         formData.append('video', file);
+        formData.append('source', 'web');
         formData.append('sample_fps', document.getElementById('sampleFps').value);
         formData.append('min_confidence', document.getElementById('minConfidence').value);
         
