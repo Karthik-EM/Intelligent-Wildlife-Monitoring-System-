@@ -1,4 +1,5 @@
 #include <WiFi.h>
+// #include <WiFiSSLClient.h> // Removed for HTTP
 #include "StreamIO.h"
 #include "VideoStream.h"
 #include "AudioStream.h"
@@ -6,11 +7,17 @@
 #include "MP4Recording.h"
 #include "AmebaFatFS.h"
 #include "sys_api.h" 
+#include "PowerMode.h" // Preserved Deep Sleep
 
 #define CHANNEL 0
 #define FILENAME "TestRecordingAV.mp4"
 #define CONFIG_FILENAME "wifi_conf.txt"
 #define RECORDING_DURATION 10 
+
+// ================= DEEP SLEEP CONFIG =================
+#define WAKEUP_SOURCE 1   // 1: wake up by AON GPIO
+#define WAKEUP_PIN    21  // Pin 21 (High)
+#define RETENTION     0
 
 // ================= LED DEFINITIONS =================
 #define LED_RECORDING  LED_G  
@@ -20,11 +27,8 @@
 String config_ssid = "";
 String config_pass = "";
 String config_host = "";
+int server_port = 5000; // Changed to 5000 for local HTTP (Flask default)
 
-// Default to Port 5000 (Flask), but you can change logic if needed
-int server_port = 5000;
-
-// Video/Audio Settings
 VideoSetting configV(VIDEO_HD, 15, VIDEO_H264, 0);
 AudioSetting configA(0); 
 
@@ -35,8 +39,8 @@ StreamIO audioStreamer(1, 1);
 StreamIO avMixStreamer(2, 1);
 AmebaFatFS fs;
 
-// HTTP Client (Fixed for Flask)
-WiFiClient client;
+// WiFiSSLClient client; // Removed
+WiFiClient client;       // Added Standard HTTP Client
 WiFiServer server(80); 
 
 // ================= HELPER: LOAD/SAVE CONFIG =================
@@ -71,8 +75,8 @@ bool loadConfig() {
         config_ssid.trim();
         config_pass.trim();
         config_host.trim();
-        
-        // SAFETY: Remove http:// or https:// if user typed it
+
+        // SAFETY: Remove http:// or https:// if user typed it in the file
         config_host.replace("http://", "");
         config_host.replace("https://", "");
         
@@ -89,7 +93,7 @@ bool loadConfig() {
     return false;
 }
 
-// ================= CONFIG PORTAL =================
+// ================= CONFIG PORTAL (AP MODE) =================
 
 void startConfigPortal() {
     Serial.println("\n!!! STARTING CONFIG PORTAL !!!");
@@ -124,9 +128,9 @@ void startConfigPortal() {
                                     String new_pass = request.substring(idx_pass + 6, idx_host);
                                     String new_host = request.substring(idx_host + 6, idx_end);
                                     
-                                    // Decode URL encoding if necessary (Simple replacement)
+                                    // Basic URL Decode
                                     new_ssid.replace("%20", " ");
-                                    
+
                                     saveConfig(new_ssid, new_pass, new_host);
 
                                     client.println("HTTP/1.1 200 OK");
@@ -135,6 +139,7 @@ void startConfigPortal() {
                                     client.println("<h1>Saved! Rebooting...</h1>");
                                     delay(1000);
                                     client.stop();
+                                    
                                     Serial.println("Rebooting...");
                                     NVIC_SystemReset();
                                 }
@@ -170,6 +175,7 @@ void startConfigPortal() {
 void stopAllStreaming() {
     Serial.println("--- Stopping All Streaming ---");
     digitalWrite(LED_RECORDING, LOW);
+
     mp4.end();
     delay(500);
     avMixStreamer.pause();
@@ -201,7 +207,7 @@ void connectToWiFi() {
 
         Serial.print(".");
         retries++;
-        if(retries > 30) {
+        if(retries > 30) { 
             Serial.println("\nFailed to connect to WiFi.");
             startConfigPortal(); 
             return;
@@ -228,24 +234,25 @@ void uploadVideo() {
     }
     file.close();
 
-    Serial.println("--- Starting Upload to: " + config_host + " ---");
+    Serial.println("--- Starting Upload to: " + config_host + ":" + String(server_port) + " ---");
 
     char host_buf[100];
     config_host.toCharArray(host_buf, 100);
 
     client.setTimeout(20000);
-
-    // Connecting to Port 5000 (Flask)
+    
+    // Connect via Standard HTTP (not SSL)
     if (client.connect(host_buf, server_port)) {
         Serial.println("Connected to Server!");
     } else {
-        Serial.println("Connection failed! Check IP.");
+        Serial.println("Connection failed! Check IP and Port.");
         return;
     }
 
     file = fs.open(FILENAME);
     
     String boundary = "---AmebaBoundary";
+    // Adding "source" field as per reference code logic
     String head = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"source\"\r\n\r\namb82\r\n";
     head += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"video\"; filename=\"" + FILENAME + "\"\r\nContent-Type: video/mp4\r\n\r\n";
     String tail = "\r\n--" + boundary + "--\r\n";
@@ -275,14 +282,15 @@ void uploadVideo() {
     Serial.println("\nFile Sent.");
     client.print(tail);
     client.flush();
-    //send and forget
-    // Serial.println("Waiting for response...");
-    // hile (client.connected() || client.available()) {
+    
+    // Read response (Optional, helpful for debugging)
+    // while (client.connected() || client.available()) {
     //    if (client.available()) {
-    //         String line = client.readStringUntil('\n');
+    //        String line = client.readStringUntil('\n');
     //        Serial.println(line);
-    //     }
+    //    }
     // }
+    
     client.stop();
     Serial.println("Upload Complete.");
 }
@@ -292,24 +300,24 @@ void uploadVideo() {
 void setup() {
     Serial.begin(115200);
     
+    // 1. Initialize Deep Sleep Configuration
+    PowerMode.begin(DEEPSLEEP_MODE, WAKEUP_SOURCE, RETENTION, WAKEUP_PIN);
+    
     pinMode(LED_RECORDING, OUTPUT);
     pinMode(LED_WIFI, OUTPUT);
     digitalWrite(LED_RECORDING, LOW);
     digitalWrite(LED_WIFI, LOW);
     
-    // 1. Init SD Card
     if (!fs.begin()) {
         Serial.println("SD Mount Failed!");
         while(1);
     }
 
-    // 2. Load Configuration (RESTORED)
     if (!loadConfig()) {
         Serial.println("No Config Found. Starting Config Portal...");
         startConfigPortal(); 
     }
 
-    // 3. Record Video
     Serial.println("--- Starting Recording Sequence ---");
     digitalWrite(LED_RECORDING, HIGH);
 
@@ -343,11 +351,16 @@ void setup() {
     
     stopAllStreaming(); 
 
-    // 4. Connect & Upload
     connectToWiFi(); 
     uploadVideo();
+
+    // ================= ENTER DEEP SLEEP =================
+    Serial.println("Task complete. Entering Deep Sleep. Wake up via Pin 21 High.");
+    delay(1000); 
+    PowerMode.start(); 
+    // ====================================================
 }
 
 void loop() {
-    // Nothing to do here
+    // Execution will never reach here as board resets on wakeup
 }
