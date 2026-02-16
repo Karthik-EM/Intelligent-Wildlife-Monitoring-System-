@@ -400,46 +400,20 @@
     const container = document.getElementById('resultsGrid');
     container.innerHTML = '';
 
+    // The backend now handles filtering. 
+    // If we receive data, we assume it is valid and ready to show.
+
     if (!detections || detections.length === 0) {
-        container.innerHTML = '<div style="text-align:center; color:#aaa; padding:2rem;">No biological entities detected.</div>';
+        container.innerHTML = '<div style="text-align:center; color:#aaa; padding:2rem;">No relevant detections found.</div>';
         return;
     }
 
-    // 1. FILTERING LOGIC
-    // Sort by time first
-    detections.sort((a, b) => a.time - b.time);
-
-    const visibleDetections = [];
-    const lastSeenMap = {}; // Tracks last time we saw EACH species
-    const TIME_THRESHOLD = 5; // Seconds to wait before showing SAME species
-
-    detections.forEach(d => {
-        // A. REMOVE LOW CONFIDENCE ( < 70% )
-        const conf = d.confidence || 0;
-        if (conf <= 0.5) return;
-
-        // B. REMOVE CLUTTER (Time Check)
-        const lastTime = lastSeenMap[d.species] || -999;
-
-        // Only add if time gap > 5s
-        if ((d.time - lastTime) > TIME_THRESHOLD) {
-            visibleDetections.push(d);
-            lastSeenMap[d.species] = d.time; 
-        }
-    });
-
-    if (visibleDetections.length === 0) {
-        container.innerHTML = '<div style="text-align:center; color:#aaa; padding:2rem;">No high-confidence detections found.</div>';
-        return;
-    }
-
-    // 2. RENDERING LOGIC
+    // Group by Species
     const bySpecies = {};
-    visibleDetections.forEach(d => {
+    detections.forEach(d => {
         if (!bySpecies[d.species]) bySpecies[d.species] = [];
         bySpecies[d.species].push(d);
     });
-
     for (const [species, dets] of Object.entries(bySpecies)) {
         dets.sort((a, b) => a.time - b.time);
 
