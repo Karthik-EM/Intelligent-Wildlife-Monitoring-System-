@@ -1,6 +1,5 @@
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <math.h>
 #include <WiFi.h>
@@ -10,7 +9,6 @@
 #include <driver/i2s.h>
 #include <arduinoFFT.h>
 
-//orginal
 // ==========================================
 // PIN DEFINITIONS
 // ==========================================
@@ -30,27 +28,26 @@ const int wificonfig_button = 5;
 #define I2S_PORT I2S_NUM_0
 
 // ==========================================
-// SYSTEM & HEARTBEAT CONFIG (NEW)
+// SYSTEM & HEARTBEAT CONFIG
 // ==========================================
 #define HEARTBEAT_INTERVAL 60000   // 60 seconds
 static unsigned long lastHeartbeat = 0;
 
 // ==========================================
-// AUDIO & FFT CONFIG
+// AUDIO & FFT CONFIG (STEREO ADAPTIVE)
 // ==========================================
+#define SOFTWARE_GAIN_FACTOR 0.8
+#define TRIGGER_AMP_THRESHOLD 2500
 #define I2S_SAMPLE_RATE 16000
 #define SAMPLES_PER_CHUNK 256
-#define SOFTWARE_GAIN_FACTOR 0.8
-#define TRIGGER_AMP_THRESHOLD 1000
 
-// Gunshot Detection Thresholds
 #define MIN_CONSECUTIVE_CHUNKS 8
 #define MAX_CONSECUTIVE_CHUNKS 35
 #define MAX_EVENT_DURATION 600
 
-#define RATIO_STANDARD 3.0
-#define ZCR_STANDARD 75
-#define RATIO_STRICT 9.0
+#define RATIO_STANDARD 2.0
+#define ZCR_STANDARD 50
+#define RATIO_STRICT 13.0
 #define ZCR_STRICT 100
 #define MAX_LOW_ENERGY_THRESHOLD 60000
 
@@ -79,6 +76,7 @@ int tilt_status = 0;
 volatile bool gunshotDetected = false;
 volatile double gunshotRatio = 0.0;
 volatile int gunshotZCR = 0;
+bool gunshotDataSent = false; // NEW: Prevents HTTP spamming
 
 // Buttons
 int lastButtonState = HIGH;
@@ -101,11 +99,11 @@ TaskHandle_t AudioTaskHandle;
 void sendData(bool isGunshotEvent);
 void calibrate();
 void i2sInit();
-void sendHeartbeat();   // NEW
-void handleHeartbeat(); // NEW
+void sendHeartbeat();   
+void handleHeartbeat(); 
 
 // ==========================================
-// CORE 0: AUDIO PROCESSING TASK (Untouched)
+// CORE 0: STEREO AUDIO PROCESSING TASK 
 // ==========================================
 void AudioProcessingTask(void * parameter) {
   enum State { IDLE, TRIGGERED };
@@ -114,24 +112,50 @@ void AudioProcessingTask(void * parameter) {
   int consecutiveLoudChunks = 0;
   int16_t peak_amplitude_of_event = 0;
 
-  int32_t samples32[SAMPLES_PER_CHUNK];
-  int16_t samples[SAMPLES_PER_CHUNK];
+  // We double the raw read buffer to hold both Left and Right samples
+  int32_t samples32[SAMPLES_PER_CHUNK * 2]; 
+  
+  // Separate arrays for de-interleaved stereo data
+  int16_t samplesLeft[SAMPLES_PER_CHUNK];
+  int16_t samplesRight[SAMPLES_PER_CHUNK];
+  
   size_t bytes_read;
 
   for(;;) {
     i2s_read(I2S_PORT, samples32, sizeof(samples32), &bytes_read, portMAX_DELAY);
     
     if (bytes_read > 0) {
-      int16_t current_peak = 0;
+      int16_t current_peak_L = 0;
+      int16_t current_peak_R = 0;
+      int sampleIdx = 0;
 
-      for (int i = 0; i < SAMPLES_PER_CHUNK; i++) {
-        int32_t s = samples32[i] >> 16; 
-        s *= SOFTWARE_GAIN_FACTOR;
-        if (s > 32767) s = 32767;
-        if (s < -32768) s = -32768;
-        samples[i] = (int16_t)s;
-        if (abs(samples[i]) > current_peak) current_peak = abs(samples[i]);
+      // De-interleave the 32-bit data into two 16-bit arrays
+      for (int i = 0; i < (SAMPLES_PER_CHUNK * 2); i += 2) {
+        
+        // --- Process Left Channel ---
+        int32_t sL = samples32[i] >> 16; 
+        sL *= SOFTWARE_GAIN_FACTOR;
+        if (sL > 32767) sL = 32767;
+        if (sL < -32768) sL = -32768;
+        samplesLeft[sampleIdx] = (int16_t)sL;
+        if (abs(samplesLeft[sampleIdx]) > current_peak_L) current_peak_L = abs(samplesLeft[sampleIdx]);
+
+        // --- Process Right Channel ---
+        int32_t sR = samples32[i+1] >> 16; 
+        sR *= SOFTWARE_GAIN_FACTOR;
+        if (sR > 32767) sR = 32767;
+        if (sR < -32768) sR = -32768;
+        samplesRight[sampleIdx] = (int16_t)sR;
+        if (abs(samplesRight[sampleIdx]) > current_peak_R) current_peak_R = abs(samplesRight[sampleIdx]);
+
+        sampleIdx++;
       }
+
+      // Determine the overall loudest peak between both microphones
+      int16_t current_peak = max(current_peak_L, current_peak_R);
+
+      // Determine which channel had the loudest audio to save for FFT analysis
+      int16_t* loudest_channel_buffer = (current_peak_L > current_peak_R) ? samplesLeft : samplesRight;
 
       switch (currentState) {
         case IDLE:
@@ -140,7 +164,9 @@ void AudioProcessingTask(void * parameter) {
             eventStartTime = millis();
             consecutiveLoudChunks = 1;
             peak_amplitude_of_event = current_peak;
-            memcpy(peak_chunk_buffer, samples, sizeof(samples));
+            
+            // Save the audio from the loudest microphone for FFT
+            memcpy(peak_chunk_buffer, loudest_channel_buffer, sizeof(samplesLeft));
             Serial.printf("Triggered (Amp: %d)... ", current_peak);
           }
           break;
@@ -150,15 +176,14 @@ void AudioProcessingTask(void * parameter) {
             consecutiveLoudChunks++;
             if (current_peak > peak_amplitude_of_event) {
               peak_amplitude_of_event = current_peak;
-              memcpy(peak_chunk_buffer, samples, sizeof(samples));
+              memcpy(peak_chunk_buffer, loudest_channel_buffer, sizeof(samplesLeft));
             }
           }
 
           if (millis() - eventStartTime > MAX_EVENT_DURATION) {
-            
             if (consecutiveLoudChunks >= MIN_CONSECUTIVE_CHUNKS && consecutiveLoudChunks <= MAX_CONSECUTIVE_CHUNKS) {
               
-              // 1. FFT
+              // FFT Processing (Running on the loudest channel's data)
               for (int i = 0; i < SAMPLES_PER_CHUNK; i++) {
                 vReal[i] = peak_chunk_buffer[i];
                 vImag[i] = 0;
@@ -171,7 +196,7 @@ void AudioProcessingTask(void * parameter) {
               double highEnergy = 0;
 
               for (int i = 2; i < SAMPLES_PER_CHUNK / 2; i++) {
-                double freq = i * 62.5; 
+                double freq = i * 62.5;
                 if (freq < 1000) lowEnergy += vReal[i];
                 if (freq > 2500) highEnergy += vReal[i];
               }
@@ -179,7 +204,6 @@ void AudioProcessingTask(void * parameter) {
 
               double ratio = highEnergy / lowEnergy;
               
-              // 2. ZCR
               int peak_zcr = 0;
               int16_t p = 0;
               for(int k=0; k<SAMPLES_PER_CHUNK; k++){
@@ -189,11 +213,10 @@ void AudioProcessingTask(void * parameter) {
 
               Serial.printf("Done. Dur:%d | Ratio:%.2f | ZCR:%d ", consecutiveLoudChunks, ratio, peak_zcr);
 
-              // 3. Logic
               bool isGunshot = false;
               bool passBass = (lowEnergy < MAX_LOW_ENERGY_THRESHOLD);
 
-              if (consecutiveLoudChunks <= 22) {
+              if (consecutiveLoudChunks <= 25) {
                  if (ratio > RATIO_STANDARD && peak_zcr > ZCR_STANDARD && passBass) {
                     isGunshot = true;
                     Serial.print("[Standard Pass]");
@@ -208,19 +231,23 @@ void AudioProcessingTask(void * parameter) {
               }
 
               if (isGunshot) {
-                  digitalWrite(wake_up, HIGH); 
-                Serial.println(" -> >>> GUNSHOT CONFIRMED <<<");
+                // Link back to original system triggers
+                digitalWrite(wake_up, HIGH); 
+                digitalWrite(ledPin, HIGH);
+                
                 gunshotRatio = ratio;
                 gunshotZCR = peak_zcr;
                 gunshotDetected = true; 
-                digitalWrite(ledPin, HIGH);
                 
+                Serial.println(" -> >>> STEREO GUNSHOT CONFIRMED <<<");
               } else {
-                Serial.println(" -> REJECTED");
+                 Serial.println(" -> REJECTED");
               }
+
             } else {
-               Serial.printf("Done. REJECTED: Duration (%d) out of bounds.\n", consecutiveLoudChunks);
+              Serial.printf("Done. REJECTED: Duration (%d) out of bounds.\n", consecutiveLoudChunks);
             }
+            
             currentState = IDLE;
           }
           break;
@@ -230,19 +257,18 @@ void AudioProcessingTask(void * parameter) {
 }
 
 // ==========================================
-// HELPER: Send Data (Events)
+// HELPER: Send Data (Events) -> HTTP
 // ==========================================
 void sendData(bool isGunshotEvent) {
   if (WiFi.status() == WL_CONNECTED) {
      digitalWrite(wifi_on, HIGH);
      digitalWrite(wifi_off, 0);
 
-WiFiClientSecure client;
-client.setInsecure();
-
-HTTPClient http;
-http.begin(client, serverUrl);
-     http.addHeader("Content-Type", "application/json");
+    // Using standard WiFiClient for HTTP (Port 80/5000)
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, serverUrl);
+    http.addHeader("Content-Type", "application/json");
 
      char payload[128];
      int gsFlag = isGunshotEvent ? 1 : 0;
@@ -256,7 +282,7 @@ http.begin(client, serverUrl);
      int code = http.POST(payload);
      
      if (code > 0) {
-        Serial.println("Sent Event to server");
+        Serial.println("Sent Event to server via HTTP");
         Serial.println(http.getString());
      } else {
         Serial.print("HTTP Error: ");
@@ -272,24 +298,20 @@ http.begin(client, serverUrl);
 }
 
 // ==========================================
-// HELPER: Send Heartbeat (NEW)
+// HELPER: Send Heartbeat -> HTTP
 // ==========================================
 void sendHeartbeat() {
     if (WiFi.status() != WL_CONNECTED) return;
 
-WiFiClientSecure client;
-client.setInsecure();
-
-HTTPClient http;
-http.begin(client, serverUrl);
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, serverUrl);
     http.addHeader("Content-Type", "application/json");
 
     uint32_t freeHeap = ESP.getFreeHeap();
     uint32_t minHeap  = ESP.getMinFreeHeap();
     int8_t rssi       = WiFi.RSSI();
     
-    // NOTE: temperatureRead() returns internal ESP32 die temp, not room temp.
-    // It is useful for overheating detection.
     float temperature = temperatureRead(); 
 
     char payload[180];
@@ -307,8 +329,6 @@ http.begin(client, serverUrl);
 
     int code = http.POST(payload);
     if(code > 0) {
-       // Optional: Uncomment if you want to see heartbeat logs
-       // Serial.printf("Heartbeat Sent. RSSI: %d | Heap: %u\n", rssi, freeHeap);
        http.getString(); // Consume response to clear buffer
     }
     http.end();
@@ -350,15 +370,13 @@ void calibrate() {
   refMag = sqrt(refAccelX*refAccelX + refAccelY*refAccelY + refAccelZ*refAccelZ);
 
   Serial.println("New reference saved!");
-// Restore LED state based on WiFi status
-if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(wifi_on, HIGH);
-    digitalWrite(wifi_off, LOW);
-} else {
-    digitalWrite(wifi_on, LOW);
-    digitalWrite(wifi_off, HIGH);
-}
-
+  if (WiFi.status() == WL_CONNECTED) {
+     digitalWrite(wifi_on, HIGH);
+     digitalWrite(wifi_off, LOW);
+  } else {
+     digitalWrite(wifi_on, LOW);
+     digitalWrite(wifi_off, HIGH);
+  }
 }
 
 // ==========================================
@@ -408,7 +426,9 @@ void setup() {
 
   // --- Preferences & WiFi ---
   preferences.begin("my-app", false);
-  String storedUrl = preferences.getString("server_url", "https://render-flask-server-hc64.onrender.com/update");
+  
+  String storedUrl = preferences.getString("server_url", "http://192.168.1.100:5000/update");
+  
   storedUrl.toCharArray(serverUrlBuffer, 100);
   serverUrl = storedUrl;
   Serial.print("Loaded Server URL: "); Serial.println(serverUrl);
@@ -440,13 +460,13 @@ void setup() {
 // ==========================================
 void loop() {
   
-  // ---- 1. SYSTEM HEARTBEAT (NEW) ----
+  // ---- 1. SYSTEM HEARTBEAT ----
   handleHeartbeat();
 
   // ---- 2. GUNSHOT EVENT (High Priority) ----
-  if (gunshotDetected) {
+  if (gunshotDetected && !gunshotDataSent) {
       sendData(true); 
-     
+      gunshotDataSent = true; // Prevents the HTTP request from looping endlessly
   }
 
   // ---- 3. FAST LOOP (Buttons) ----
@@ -517,26 +537,24 @@ void loop() {
     last_angle = current_angle;
     last_motion = motion_status;
     motion_status = (motion1 == HIGH && motion2 == HIGH);
-// ============================================================
-    // UPDATED LOGIC: OR Gate for Wake Up
-    // ============================================================
-    // Pin 18 (wake_up) stays HIGH if Motion is present OR Gunshot was recently detected
+    
     bool anyEventActive = (motion_status == 1) || (gunshotDetected == true);
 
     digitalWrite(wake_up, anyEventActive ? HIGH : LOW);
-    digitalWrite(ledPin, anyEventActive ? HIGH : LOW);
+    //digitalWrite(ledPin, anyEventActive ? HIGH : LOW);
 
-    // Now that we have handled the pin, we can safely reset the gunshot flag
+    // Reset gunshot flags for the next event
     if (gunshotDetected) {
        gunshotDetected = false; 
+       gunshotDataSent = false;
     }
-    // ============================================================
 
     if (last_motion != motion_status || tilt_status) {
        sendData(false); 
     }
   } 
 }
+
 // ==========================================
 // I2S INIT
 // ==========================================
@@ -545,7 +563,7 @@ void i2sInit() {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = I2S_SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = 0,
     .dma_buf_count = 8,
