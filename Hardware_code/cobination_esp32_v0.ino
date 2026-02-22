@@ -86,6 +86,14 @@ int lastWifiButtonState = HIGH;
 unsigned long previousMillis = 0;
 const long interval = 1000; 
 
+// --- MOTION HOLD TIMER VARIABLES ---
+const unsigned long MOTION_HOLD_TIME_MS = 5000; // Wait x seconds of silence before sending "Motion False"
+unsigned long lastRawMotionTime = 0;             // Tracks the last exact millisecond the sensor saw movement
+bool serverMotionState = false;                  // Tracks what state the server currently thinks we are in
+// -----------------------------------
+// --- NEW COOLDOWN VARIABLES ---
+const unsigned long EVENT_COOLDOWN_MS = 30000; // 30 seconds cooldown (change this to whatever you want)
+unsigned long lastEventSendTime = 0;           // Remembers the last time we sent an active motion alert
 // Server
 char serverUrlBuffer[100];
 String serverUrl;
@@ -530,18 +538,50 @@ void loop() {
 
     Serial.print("Tilt Angle: "); Serial.println(current_angle);
 
+    // ... (keep your existing tilt_status calculation code) ...
+
     tilt_status = 0;
     if(last_angle > 30 && current_angle < 30) tilt_status = 1;
     else if(current_angle > 30 && abs(current_angle - last_angle) > 2.0) tilt_status = 1;
 
     last_angle = current_angle;
-    last_motion = motion_status;
-    motion_status = (motion1 == HIGH && motion2 == HIGH);
+
+    // --- NEW OCCUPANCY HOLD TIMER LOGIC ---
     
+    // 1. Read the raw sensors (are they currently triggered?)
+    int raw_motion = (motion1 == HIGH && motion2 == HIGH);
+    bool trigger_send = false;
+
+    // 2. TILT is high priority - trigger immediately
+    if (tilt_status == 1) {
+        trigger_send = true;
+        Serial.println("Tilt detected!");
+    }
+
+    // 3. MOTION logic
+    if (raw_motion == 1) {
+        lastRawMotionTime = currentMillis; // Keep resetting the silence timer as long as they are moving
+
+        // If the server thinks the room is empty, tell it motion started!
+        if (serverMotionState == false) {
+            serverMotionState = true;
+            trigger_send = true;
+            Serial.println("Motion started. Alerting server.");
+        }
+    } else {
+        // Raw motion is 0. Have we waited long enough in silence to be SURE they are gone?
+        if (serverMotionState == true && (currentMillis - lastRawMotionTime >= MOTION_HOLD_TIME_MS)) {
+            serverMotionState = false; // Mark the room as empty
+            trigger_send = true;
+            Serial.println("Motion definitely stopped. Alerting server.");
+        }
+    }
+
+    // 4. Update global variables and Send
+    motion_status = serverMotionState ? 1 : 0; // Ensures sendData() packages the correct 1 or 0
     bool anyEventActive = (motion_status == 1) || (gunshotDetected == true);
 
     digitalWrite(wake_up, anyEventActive ? HIGH : LOW);
-    //digitalWrite(ledPin, anyEventActive ? HIGH : LOW);
 
     // Reset gunshot flags for the next event
     if (gunshotDetected) {
@@ -549,11 +589,15 @@ void loop() {
        gunshotDataSent = false;
     }
 
-    if (last_motion != motion_status || tilt_status) {
-       sendData(false); 
+    // Only send the HTTP request if the state actually changed
+    if (trigger_send) {
+        sendData(false);
     }
+    // --------------------------------------
   } 
 }
+    // ------------------------------------
+
 
 // ==========================================
 // I2S INIT
