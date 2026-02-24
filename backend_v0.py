@@ -32,7 +32,7 @@ sensor_alert_history = {
     "tilt": 0,
     "gunshot": 0
 }
-SENSOR_COOLDOWN = 60  # Seconds to wait before alerting again
+SENSOR_COOLDOWN = 5  # Seconds to wait before alerting again
 # ==========================================
 # 1. INITIALIZATION & CONFIGURATION
 # ==========================================
@@ -157,7 +157,9 @@ class BatchVideoProcessor:
 
                 if frame_count % frame_interval == 0:
                     current_time_sec = frame_count / fps
-
+                    # --- ADDED CODE: Rotate frame 90 degrees anti-clockwise ---
+                    frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                    # ----------------------------------------------------------
                     # Save temp frame
                     frame_name = f"frame_{uuid.uuid4().hex}.jpg"
                     frame_path = os.path.join(TEMP_DIR, frame_name)
@@ -555,7 +557,7 @@ def update():
 
     # --- C. GUNSHOT ALERT ---
     if data.get('gunshot') == 1:
-        if (current_time - sensor_alert_history['gunshot']) > SENSOR_COOLDOWN:
+        if (current_time - sensor_alert_history['gunshot']) > 2:
             msg = f"🔥 *GUNSHOT DETECTED* 🔥\n\n⏱️ *Time:* {datetime.now().strftime('%H:%M:%S')}\n📍 *Unit:* Field Cam 01\n*IMMEDIATE ACTION REQUIRED*"
             Thread(target=send_telegram_alert, args=(msg,)).start()
             sensor_alert_history['gunshot'] = current_time
