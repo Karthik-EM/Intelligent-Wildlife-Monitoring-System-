@@ -1,9 +1,8 @@
 
-#  Intelligent-Wildlife-Monitoring-System
-
+# 🐾 Wildllife Monitoring System
 A fully local, AI-powered wildlife monitoring and IoT security system built for Windows. This project combines **Google's SpeciesNet**  with a real-time **MQTT sensor dashboard** to monitor remote field cameras .
 
-##  Features
+## ✨ Features
 * **AI Image & Video Analysis:** Fast, local inference using SpeciesNet to identify wildlife in photos and MP4 videos.
 * **GPU Accelerated:** Optimized for local NVIDIA RTX hardware via PyTorch and CUDA.
 * **IoT Sensor Dashboard:** Real-time monitoring of field units (Motion, Tilt, Gunshot detection) via an MQTT broker.
@@ -11,7 +10,7 @@ A fully local, AI-powered wildlife monitoring and IoT security system built for 
 
 ---
 
-##  1. Prerequisites
+## 🛠️ 1. Prerequisites
 Before installing, ensure your Windows machine has the following:
 * **Python 3.9, 3.10, or 3.11:** [Download Python](https://www.python.org/downloads/) (Make sure to check "Add Python to PATH" during installation).
 * **NVIDIA GPU Drivers:** Required for hardware acceleration.
@@ -19,7 +18,7 @@ Before installing, ensure your Windows machine has the following:
 
 ---
 
-##  2. Project Setup
+## 🚀 2. Project Setup
 
 ### Create the Project Structure
 Open your terminal (PowerShell) and create your project folder. Run this command inside your new folder to instantly build the required directory structure:
@@ -79,7 +78,7 @@ pip install -r requirements.txt
 
 ---
 
-## 3. Install the AI Model (Crucial Step)
+## 🧠 3. Install the AI Model (Crucial Step)
 
 The SpeciesNet AI model is a ~200MB file that must be downloaded manually.
 
@@ -144,7 +143,7 @@ WildlifeProject/
 
 ---
 
-##  6. Running the Server
+## 🏃‍♂️ 6. Running the Server
 
 1. Ensure your Mosquitto MQTT broker is running in the background.
 2. Open your terminal, activate your virtual environment, and run:
@@ -163,10 +162,10 @@ python app.py
 
 ---
 
-##  Troubleshooting
+## 🔧 Troubleshooting
 
 * **Server is running, but the browser says "Site cannot be reached" (HTTP 404/Refused):**
-Windows Defender Firewall is likely blocking Python. Open Windows Search -> "Windows Defender Firewall with Advanced Security" -> Enable Private connections. Restart the server and check BOTH "Private" and "Public" networks on the security popup.
+Windows Defender Firewall is likely blocking Python. Open Windows Search -> "Windows Defender Firewall with Advanced Security" -> "Inbound Rules". Delete all rules named `python.exe`. Restart the server and check BOTH "Private" and "Public" networks on the security popup.
 * **Model Load Error: `No such file or directory 'info.json'`:**
 Your Kaggle model files are extracted into a subfolder. Move them out of the `archive` folder directly into `speciesnet_model`.* **MQTT Connection Error:**
 Ensure Mosquitto is installed and the Windows Service is actively running. The script attempts to connect to `127.0.0.1` on port `1883`.
