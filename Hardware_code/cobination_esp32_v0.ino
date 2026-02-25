@@ -4,7 +4,7 @@
 #include <math.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
-#include <HTTPClient.h>
+#include <PubSubClient.h> 
 #include <Preferences.h>
 #include <driver/i2s.h>
 #include <arduinoFFT.h>
@@ -58,6 +58,13 @@ Adafruit_MPU6050 mpu;
 Preferences preferences;
 ArduinoFFT<double> FFT = ArduinoFFT<double>();
 
+// MQTT Client Setup
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+const int mqttPort = 1883;
+const char* topicEvents = "security/events";       
+const char* topicHeartbeat = "security/heartbeat"; 
+
 // Audio Buffers
 double vReal[SAMPLES_PER_CHUNK];
 double vImag[SAMPLES_PER_CHUNK];
@@ -76,7 +83,7 @@ int tilt_status = 0;
 volatile bool gunshotDetected = false;
 volatile double gunshotRatio = 0.0;
 volatile int gunshotZCR = 0;
-bool gunshotDataSent = false; // NEW: Prevents HTTP spamming
+bool gunshotDataSent = false;
 
 // Buttons
 int lastButtonState = HIGH;
@@ -85,18 +92,19 @@ int lastWifiButtonState = HIGH;
 // Timing
 unsigned long previousMillis = 0;
 const long interval = 1000; 
+unsigned long lastMQTTReconnectAttempt = 0; 
 
 // --- MOTION HOLD TIMER VARIABLES ---
-const unsigned long MOTION_HOLD_TIME_MS = 5000; // Wait x seconds of silence before sending "Motion False"
-unsigned long lastRawMotionTime = 0;             // Tracks the last exact millisecond the sensor saw movement
-bool serverMotionState = false;                  // Tracks what state the server currently thinks we are in
+const unsigned long MOTION_HOLD_TIME_MS = 5000; 
+unsigned long lastRawMotionTime = 0;            
+bool serverMotionState = false;                 
 // -----------------------------------
 // --- NEW COOLDOWN VARIABLES ---
-const unsigned long EVENT_COOLDOWN_MS = 30000; // 30 seconds cooldown (change this to whatever you want)
-unsigned long lastEventSendTime = 0;           // Remembers the last time we sent an active motion alert
+const unsigned long EVENT_COOLDOWN_MS = 30000; 
+unsigned long lastEventSendTime = 0;           
 // Server
 char serverUrlBuffer[100];
-String serverUrl;
+String serverUrl; 
 
 // Task Handle for Audio
 TaskHandle_t AudioTaskHandle;
@@ -109,6 +117,7 @@ void calibrate();
 void i2sInit();
 void sendHeartbeat();   
 void handleHeartbeat(); 
+void reconnectMQTT(); 
 
 // ==========================================
 // CORE 0: STEREO AUDIO PROCESSING TASK 
@@ -120,13 +129,9 @@ void AudioProcessingTask(void * parameter) {
   int consecutiveLoudChunks = 0;
   int16_t peak_amplitude_of_event = 0;
 
-  // We double the raw read buffer to hold both Left and Right samples
   int32_t samples32[SAMPLES_PER_CHUNK * 2]; 
-  
-  // Separate arrays for de-interleaved stereo data
   int16_t samplesLeft[SAMPLES_PER_CHUNK];
   int16_t samplesRight[SAMPLES_PER_CHUNK];
-  
   size_t bytes_read;
 
   for(;;) {
@@ -137,9 +142,7 @@ void AudioProcessingTask(void * parameter) {
       int16_t current_peak_R = 0;
       int sampleIdx = 0;
 
-      // De-interleave the 32-bit data into two 16-bit arrays
       for (int i = 0; i < (SAMPLES_PER_CHUNK * 2); i += 2) {
-        
         // --- Process Left Channel ---
         int32_t sL = samples32[i] >> 16; 
         sL *= SOFTWARE_GAIN_FACTOR;
@@ -159,10 +162,7 @@ void AudioProcessingTask(void * parameter) {
         sampleIdx++;
       }
 
-      // Determine the overall loudest peak between both microphones
       int16_t current_peak = max(current_peak_L, current_peak_R);
-
-      // Determine which channel had the loudest audio to save for FFT analysis
       int16_t* loudest_channel_buffer = (current_peak_L > current_peak_R) ? samplesLeft : samplesRight;
 
       switch (currentState) {
@@ -173,7 +173,6 @@ void AudioProcessingTask(void * parameter) {
             consecutiveLoudChunks = 1;
             peak_amplitude_of_event = current_peak;
             
-            // Save the audio from the loudest microphone for FFT
             memcpy(peak_chunk_buffer, loudest_channel_buffer, sizeof(samplesLeft));
             Serial.printf("Triggered (Amp: %d)... ", current_peak);
           }
@@ -191,7 +190,6 @@ void AudioProcessingTask(void * parameter) {
           if (millis() - eventStartTime > MAX_EVENT_DURATION) {
             if (consecutiveLoudChunks >= MIN_CONSECUTIVE_CHUNKS && consecutiveLoudChunks <= MAX_CONSECUTIVE_CHUNKS) {
               
-              // FFT Processing (Running on the loudest channel's data)
               for (int i = 0; i < SAMPLES_PER_CHUNK; i++) {
                 vReal[i] = peak_chunk_buffer[i];
                 vImag[i] = 0;
@@ -239,7 +237,6 @@ void AudioProcessingTask(void * parameter) {
               }
 
               if (isGunshot) {
-                // Link back to original system triggers
                 digitalWrite(wake_up, HIGH); 
                 digitalWrite(ledPin, HIGH);
                 
@@ -265,18 +262,37 @@ void AudioProcessingTask(void * parameter) {
 }
 
 // ==========================================
-// HELPER: Send Data (Events) -> HTTP
+// HELPER: Reconnect MQTT (Non-Blocking)
+// ==========================================
+void reconnectMQTT() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  if (!mqttClient.connected()) {
+    if (millis() - lastMQTTReconnectAttempt > 5000) {
+      lastMQTTReconnectAttempt = millis();
+      Serial.print("Attempting MQTT connection...");
+      
+      String clientId = "ESP32Security-";
+      clientId += String(random(0xffff), HEX);
+      
+      if (mqttClient.connect(clientId.c_str())) {
+        Serial.println("connected");
+      } else {
+        Serial.print("failed, rc=");
+        Serial.print(mqttClient.state());
+        Serial.println(" try again in 5 seconds");
+      }
+    }
+  }
+}
+
+// ==========================================
+// HELPER: Send Data (Events) -> MQTT
 // ==========================================
 void sendData(bool isGunshotEvent) {
-  if (WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
      digitalWrite(wifi_on, HIGH);
      digitalWrite(wifi_off, 0);
-
-    // Using standard WiFiClient for HTTP (Port 80/5000)
-    WiFiClient client;
-    HTTPClient http;
-    http.begin(client, serverUrl);
-    http.addHeader("Content-Type", "application/json");
 
      char payload[128];
      int gsFlag = isGunshotEvent ? 1 : 0;
@@ -287,39 +303,29 @@ void sendData(bool isGunshotEvent) {
               "{\"motion\":%d,\"tilt\":%.2f,\"gunshot\":%d,\"ratio\":%.2f,\"zcr\":%d}", 
               motion_status, current_angle, gsFlag, r, z);
      
-     int code = http.POST(payload);
+     bool success = mqttClient.publish(topicEvents, payload);
      
-     if (code > 0) {
-        Serial.println("Sent Event to server via HTTP");
-        Serial.println(http.getString());
+     if (success) {
+        Serial.println("Sent Event to server via MQTT");
      } else {
-        Serial.print("HTTP Error: ");
-        Serial.println(code);
+        Serial.println("MQTT Publish Failed");
      }
-     http.end();
   } else {
-     Serial.println("WiFi lost. Reconnecting...");
-     WiFi.reconnect();
+     Serial.println("WiFi/MQTT disconnected. Skipping send.");
   }
   
   if(isGunshotEvent) digitalWrite(ledPin, LOW); 
 }
 
 // ==========================================
-// HELPER: Send Heartbeat -> HTTP
+// HELPER: Send Heartbeat -> MQTT
 // ==========================================
 void sendHeartbeat() {
-    if (WiFi.status() != WL_CONNECTED) return;
-
-    WiFiClient client;
-    HTTPClient http;
-    http.begin(client, serverUrl);
-    http.addHeader("Content-Type", "application/json");
+    if (WiFi.status() != WL_CONNECTED || !mqttClient.connected()) return;
 
     uint32_t freeHeap = ESP.getFreeHeap();
     uint32_t minHeap  = ESP.getMinFreeHeap();
     int8_t rssi       = WiFi.RSSI();
-    
     float temperature = temperatureRead(); 
 
     char payload[180];
@@ -335,16 +341,10 @@ void sendHeartbeat() {
         millis(), freeHeap, minHeap, temperature, rssi
     );
 
-    int code = http.POST(payload);
-    if(code > 0) {
-       http.getString(); // Consume response to clear buffer
-    }
-    http.end();
+    mqttClient.publish(topicHeartbeat, payload);
 }
 
 void handleHeartbeat() {
-    if (WiFi.status() != WL_CONNECTED) return;
-
     if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
         lastHeartbeat = millis();
         sendHeartbeat();
@@ -408,18 +408,6 @@ void setup() {
   // --- I2S Setup ---
   i2sInit();
 
-  // --- Audio Task on Core 0 ---
-  xTaskCreatePinnedToCore(
-    AudioProcessingTask,   
-    "AudioTask",           
-    10000,                 
-    NULL,                  
-    1,                     
-    &AudioTaskHandle,      
-    0                      
-  );
-  Serial.println("Audio Task Started on Core 0");
-
   // --- MPU6050 Setup ---
   if (!mpu.begin()) {
     Serial.println("Failed to find MPU6050 chip");
@@ -435,25 +423,25 @@ void setup() {
   // --- Preferences & WiFi ---
   preferences.begin("my-app", false);
   
-  String storedUrl = preferences.getString("server_url", "http://192.168.1.100:5000/update");
+  String storedUrl = preferences.getString("server_url", "192.168.1.100"); 
   
   storedUrl.toCharArray(serverUrlBuffer, 100);
   serverUrl = storedUrl;
-  Serial.print("Loaded Server URL: "); Serial.println(serverUrl);
+  Serial.print("Loaded MQTT Broker IP: "); Serial.println(serverUrl);
 
   WiFiManager wifiManager;
-  WiFiManagerParameter custom_server_url("server", "Flask Server URL", serverUrlBuffer, 100);
+  WiFiManagerParameter custom_server_url("server", "MQTT Broker IP", serverUrlBuffer, 100);
   wifiManager.addParameter(&custom_server_url);
 
   if (!wifiManager.autoConnect("ESP32-Security")) {
     Serial.println("Failed to connect. Restarting...");
     digitalWrite(wifi_off, 1);
     digitalWrite(wifi_on, 0);
-    ESP.restart();
+    ESP.restart(); // SW_RESET triggered here if WiFi fails!
   } else {
     Serial.println("Connected to WiFi");
     digitalWrite(wifi_on, 1);
-     digitalWrite(wifi_off, 0);
+    digitalWrite(wifi_off, 0);
   }
 
   String newUrl = custom_server_url.getValue();
@@ -461,12 +449,35 @@ void setup() {
     preferences.putString("server_url", newUrl);
     serverUrl = newUrl;
   }
+
+  // --- Initialize MQTT ---
+  mqttClient.setServer(serverUrlBuffer, mqttPort);
+
+  // --- Start Audio Task AFTER everything else is ready ---
+  // Moving this down here prevents the task from running concurrently 
+  // with the WiFiManager blocking code above, preventing crashes.
+  xTaskCreatePinnedToCore(
+    AudioProcessingTask,   
+    "AudioTask",           
+    10000,                 
+    NULL,                  
+    1,                     
+    &AudioTaskHandle,      
+    0                      
+  );
+  Serial.println("Audio Task Started on Core 0");
 }
 
 // ==========================================
 // LOOP (Core 1)
 // ==========================================
 void loop() {
+  // ---- 0. MAINTAIN MQTT CONNECTION ----
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  } else {
+    mqttClient.loop(); 
+  }
   
   // ---- 1. SYSTEM HEARTBEAT ----
   handleHeartbeat();
@@ -474,7 +485,7 @@ void loop() {
   // ---- 2. GUNSHOT EVENT (High Priority) ----
   if (gunshotDetected && !gunshotDataSent) {
       sendData(true); 
-      gunshotDataSent = true; // Prevents the HTTP request from looping endlessly
+      gunshotDataSent = true; 
   }
 
   // ---- 3. FAST LOOP (Buttons) ----
@@ -489,7 +500,7 @@ void loop() {
         WiFiManager wifiManager;
         wifiManager.setBreakAfterConfig(true);
         serverUrl.toCharArray(serverUrlBuffer, 100);
-        WiFiManagerParameter custom_server_url("server", "Flask Server URL", serverUrlBuffer, 100);
+        WiFiManagerParameter custom_server_url("server", "MQTT Broker IP", serverUrlBuffer, 100);
         wifiManager.addParameter(&custom_server_url);
         wifiManager.startConfigPortal("ESP32-Security");
         
@@ -538,66 +549,54 @@ void loop() {
 
     Serial.print("Tilt Angle: "); Serial.println(current_angle);
 
-    // ... (keep your existing tilt_status calculation code) ...
-
     tilt_status = 0;
     if(last_angle > 30 && current_angle < 30) tilt_status = 1;
     else if(current_angle > 30 && abs(current_angle - last_angle) > 2.0) tilt_status = 1;
 
     last_angle = current_angle;
 
-    // --- NEW OCCUPANCY HOLD TIMER LOGIC ---
-    
-    // 1. Read the raw sensors (are they currently triggered?)
+    // --- OCCUPANCY HOLD TIMER LOGIC ---
     int raw_motion = (motion1 == HIGH && motion2 == HIGH);
     bool trigger_send = false;
 
-    // 2. TILT is high priority - trigger immediately
     if (tilt_status == 1) {
         trigger_send = true;
         Serial.println("Tilt detected!");
     }
 
-    // 3. MOTION logic
     if (raw_motion == 1) {
-        lastRawMotionTime = currentMillis; // Keep resetting the silence timer as long as they are moving
-
-        // If the server thinks the room is empty, tell it motion started!
+        lastRawMotionTime = currentMillis; 
         if (serverMotionState == false) {
             serverMotionState = true;
             trigger_send = true;
             Serial.println("Motion started. Alerting server.");
         }
     } else {
-        // Raw motion is 0. Have we waited long enough in silence to be SURE they are gone?
         if (serverMotionState == true && (currentMillis - lastRawMotionTime >= MOTION_HOLD_TIME_MS)) {
-            serverMotionState = false; // Mark the room as empty
+            serverMotionState = false; 
             trigger_send = true;
             Serial.println("Motion definitely stopped. Alerting server.");
         }
     }
 
-    // 4. Update global variables and Send
-    motion_status = serverMotionState ? 1 : 0; // Ensures sendData() packages the correct 1 or 0
+    motion_status = serverMotionState ? 1 : 0; 
     bool anyEventActive = (motion_status == 1) || (gunshotDetected == true);
 
     digitalWrite(wake_up, anyEventActive ? HIGH : LOW);
 
-    // Reset gunshot flags for the next event
     if (gunshotDetected) {
        gunshotDetected = false; 
        gunshotDataSent = false;
     }
 
-    // Only send the HTTP request if the state actually changed
     if (trigger_send) {
         sendData(false);
     }
-    // --------------------------------------
   } 
-}
-    // ------------------------------------
 
+  // --- ADDED TO PREVENT WATCHDOG CRASHES ---
+  delay(10); 
+}
 
 // ==========================================
 // I2S INIT
