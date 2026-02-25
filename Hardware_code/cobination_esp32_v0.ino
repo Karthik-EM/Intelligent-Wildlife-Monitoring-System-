@@ -21,6 +21,9 @@ const int wake_up = 18;
 const int buttonPin = 4;       
 const int wificonfig_button = 5;
 
+// --- NEW CONTROL PIN ---
+const int controlPin = 23; 
+
 // I2S Microphone
 #define I2S_WS 15
 #define I2S_SD 33
@@ -36,20 +39,21 @@ static unsigned long lastHeartbeat = 0;
 // ==========================================
 // AUDIO & FFT CONFIG (STEREO ADAPTIVE)
 // ==========================================
+
 #define SOFTWARE_GAIN_FACTOR 0.8
-#define TRIGGER_AMP_THRESHOLD 2500
+#define TRIGGER_AMP_THRESHOLD 5000
 #define I2S_SAMPLE_RATE 16000
 #define SAMPLES_PER_CHUNK 256
 
 #define MIN_CONSECUTIVE_CHUNKS 8
-#define MAX_CONSECUTIVE_CHUNKS 35
+#define MAX_CONSECUTIVE_CHUNKS 45    // INCREASED from 35 to allow for room echo
 #define MAX_EVENT_DURATION 600
 
 #define RATIO_STANDARD 2.0
-#define ZCR_STANDARD 50
-#define RATIO_STRICT 13.0
-#define ZCR_STRICT 100
-#define MAX_LOW_ENERGY_THRESHOLD 60000
+#define ZCR_STANDARD 40              // LOWERED slightly for safety
+#define RATIO_STRICT 4.0             // LOWERED from 13.0 to match your 5.06 ratio
+#define ZCR_STRICT 60                // LOWERED from 100 to match your 69 ZCR
+#define MAX_LOW_ENERGY_THRESHOLD 5000000 // INCREASED so loud bass doesn't block it
 
 // ==========================================
 // GLOBALS & OBJECTS
@@ -64,6 +68,7 @@ PubSubClient mqttClient(espClient);
 const int mqttPort = 1883;
 const char* topicEvents = "security/events";       
 const char* topicHeartbeat = "security/heartbeat"; 
+const char* topicCommand = "security/command"; // --- NEW TOPIC ---
 
 // Audio Buffers
 double vReal[SAMPLES_PER_CHUNK];
@@ -118,6 +123,7 @@ void i2sInit();
 void sendHeartbeat();   
 void handleHeartbeat(); 
 void reconnectMQTT(); 
+void mqttCallback(char* topic, byte* payload, unsigned int length); // NEW
 
 // ==========================================
 // CORE 0: STEREO AUDIO PROCESSING TASK 
@@ -138,21 +144,33 @@ void AudioProcessingTask(void * parameter) {
     i2s_read(I2S_PORT, samples32, sizeof(samples32), &bytes_read, portMAX_DELAY);
     
     if (bytes_read > 0) {
+      
+      // --- 1. CALCULATE DC OFFSET (MEAN) ---
+      int32_t meanL = 0;
+      int32_t meanR = 0;
+      for (int i = 0; i < (SAMPLES_PER_CHUNK * 2); i += 2) {
+        meanL += (samples32[i] >> 16);
+        meanR += (samples32[i+1] >> 16);
+      }
+      meanL /= SAMPLES_PER_CHUNK;
+      meanR /= SAMPLES_PER_CHUNK;
+
+      // --- 2. REMOVE OFFSET, APPLY GAIN, FIND PEAKS ---
       int16_t current_peak_L = 0;
       int16_t current_peak_R = 0;
       int sampleIdx = 0;
 
       for (int i = 0; i < (SAMPLES_PER_CHUNK * 2); i += 2) {
-        // --- Process Left Channel ---
-        int32_t sL = samples32[i] >> 16; 
+        // Process Left Channel
+        int32_t sL = (samples32[i] >> 16) - meanL; // Subtract DC offset
         sL *= SOFTWARE_GAIN_FACTOR;
         if (sL > 32767) sL = 32767;
         if (sL < -32768) sL = -32768;
         samplesLeft[sampleIdx] = (int16_t)sL;
         if (abs(samplesLeft[sampleIdx]) > current_peak_L) current_peak_L = abs(samplesLeft[sampleIdx]);
 
-        // --- Process Right Channel ---
-        int32_t sR = samples32[i+1] >> 16; 
+        // Process Right Channel
+        int32_t sR = (samples32[i+1] >> 16) - meanR; // Subtract DC offset
         sR *= SOFTWARE_GAIN_FACTOR;
         if (sR > 32767) sR = 32767;
         if (sR < -32768) sR = -32768;
@@ -262,6 +280,37 @@ void AudioProcessingTask(void * parameter) {
 }
 
 // ==========================================
+// HELPER: MQTT Callback (Receives Messages)
+// ==========================================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.print("MQTT Message arrived on topic: ");
+  Serial.print(topic);
+  Serial.print(". Message: ");
+  Serial.println(message);
+
+  // Check if the message is on our command topic
+  if (String(topic) == topicCommand) {
+    message.toUpperCase(); // Make it case-insensitive
+    
+    // Turn PIN 23 HIGH if message is ON, 1, or HIGH
+    if (message == "ON" || message == "1" || message == "HIGH") {
+      digitalWrite(controlPin, HIGH);
+      Serial.println("Action: Pin 23 turned HIGH");
+    } 
+    // Turn PIN 23 LOW if message is OFF, 0, or LOW
+    else if (message == "OFF" || message == "0" || message == "LOW") {
+      digitalWrite(controlPin, LOW);
+      Serial.println("Action: Pin 23 turned LOW");
+    }
+  }
+}
+
+// ==========================================
 // HELPER: Reconnect MQTT (Non-Blocking)
 // ==========================================
 void reconnectMQTT() {
@@ -277,6 +326,9 @@ void reconnectMQTT() {
       
       if (mqttClient.connect(clientId.c_str())) {
         Serial.println("connected");
+        // --- SUBSCRIBE TO COMMANDS AFTER CONNECTING ---
+        mqttClient.subscribe(topicCommand);
+        Serial.println("Subscribed to command topic");
       } else {
         Serial.print("failed, rc=");
         Serial.print(mqttClient.state());
@@ -402,6 +454,10 @@ void setup() {
   pinMode(wake_up, OUTPUT);
   pinMode(buttonPin, INPUT_PULLUP);
   pinMode(wificonfig_button, INPUT_PULLUP);
+  
+  // --- Initialize the new control pin ---
+  pinMode(controlPin, OUTPUT);
+  digitalWrite(controlPin, LOW); // Start with it turned off
 
   digitalWrite(ledPin, LOW);
 
@@ -435,6 +491,8 @@ void setup() {
 
   if (!wifiManager.autoConnect("ESP32-Security")) {
     Serial.println("Failed to connect. Restarting...");
+    Serial.flush();
+    delay(500);
     digitalWrite(wifi_off, 1);
     digitalWrite(wifi_on, 0);
     ESP.restart(); // SW_RESET triggered here if WiFi fails!
@@ -452,10 +510,9 @@ void setup() {
 
   // --- Initialize MQTT ---
   mqttClient.setServer(serverUrlBuffer, mqttPort);
+  mqttClient.setCallback(mqttCallback); // --- REGISTER THE CALLBACK HERE ---
 
   // --- Start Audio Task AFTER everything else is ready ---
-  // Moving this down here prevents the task from running concurrently 
-  // with the WiFiManager blocking code above, preventing crashes.
   xTaskCreatePinnedToCore(
     AudioProcessingTask,   
     "AudioTask",           
@@ -476,7 +533,7 @@ void loop() {
   if (!mqttClient.connected()) {
     reconnectMQTT();
   } else {
-    mqttClient.loop(); 
+    mqttClient.loop(); // This line is what actually checks for incoming messages!
   }
   
   // ---- 1. SYSTEM HEARTBEAT ----
