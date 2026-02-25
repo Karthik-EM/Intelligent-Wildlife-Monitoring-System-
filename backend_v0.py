@@ -10,14 +10,13 @@ import torch
 import gc
 import cv2
 import requests
+import paho.mqtt.client as mqtt # NEW: Imported paho-mqtt
 from werkzeug.utils import secure_filename
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from flask_cors import CORS
-from threading import Lock
+from threading import Lock, Thread
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
-
-from threading import Thread
 from dotenv import load_dotenv
 
 # Load secrets
@@ -26,67 +25,56 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 # --- GLOBAL TRACKERS FOR SENSOR ALERTS ---
-# We store the last time (timestamp) we sent an alert to prevent spam
 sensor_alert_history = {
     "motion": 0,
     "tilt": 0,
     "gunshot": 0
 }
-SENSOR_COOLDOWN = 5  # Seconds to wait before alerting again
+SENSOR_COOLDOWN = 5  
+
 # ==========================================
 # 1. INITIALIZATION & CONFIGURATION
 # ==========================================
 
-# --- Path Configuration (WINDOWS PORTABLE) ---
 BASE_DIR = os.getcwd()
 MODEL_FOLDER = os.path.join(BASE_DIR, "speciesnet_model")
 CACHE_DIR = os.path.join(BASE_DIR, ".cache")
 DETECTIONS_DIR = os.path.join(BASE_DIR, "static", "detections")
 VIDEO_DIR = os.path.join(BASE_DIR, "uploads", "videos")
 TEMP_DIR = os.path.join(BASE_DIR, "temp_inference", "frames")
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads") # Added generic upload dir
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads") 
 
-# Set environment variables for SpeciesNet
 os.environ["XDG_CACHE_HOME"] = CACHE_DIR
 os.environ["SPECIESNET_CACHE"] = CACHE_DIR
 os.environ["TORCH_HOME"] = CACHE_DIR
 
-# Create necessary folders
 os.makedirs(DETECTIONS_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(os.path.join(BASE_DIR, "templates"), exist_ok=True)
 
-# Initialize Flask
 app = Flask(__name__)
 CORS(app)
 
-# --- Hardware Check ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 print(f"📂 WORKING DIR: {BASE_DIR}")
 print(f"📂 IMAGES SAVE TO: {DETECTIONS_DIR}")
 print(f"🖥️ DEVICE: {DEVICE}")
 
-# --- Database Config ---
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{os.path.join(BASE_DIR, "species_data.db")}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# Global Video Processor
 video_processor = None
 
 # ==========================================
 # telegram fuction
 # ==========================================
 def send_telegram_alert(message):
-    """
-    Sends a text-only alert to Telegram.
-    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
@@ -98,6 +86,7 @@ def send_telegram_alert(message):
         print(f"✅ Telegram sent: {message}")
     except Exception as e:
         print(f"❌ Telegram Error: {e}")
+
 # ==========================================
 # 2. DATABASE MODELS
 # ==========================================
@@ -129,133 +118,83 @@ class BatchVideoProcessor:
 
     def process_video_batched(self, video_path, batch_size=8, sample_fps=1, min_confidence=0.3, country='IND'):
         print(f"\n🏆 PROCESSING VIDEO: {video_path}")
-        
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
         if fps == 0: 
             print("❌ Error: Video FPS is 0.")
             return []
-
         frame_interval = int(max(1, fps / sample_fps))
-        
         paths_buffer = []
         timestamps_buffer = []
         all_detections = []
-        
-        # Dictionary to track last alert time for each species in THIS video
-        # { 'Cheetah': 12.5, 'Zebra': 45.0 }
         video_alert_history = {} 
-        
         frame_count = 0
-
         try:
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret: break 
-
                 if frame_count % frame_interval == 0:
                     current_time_sec = frame_count / fps
-                    # --- ADDED CODE: Rotate frame 90 degrees anti-clockwise ---
                     frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-                    # ----------------------------------------------------------
-                    # Save temp frame
                     frame_name = f"frame_{uuid.uuid4().hex}.jpg"
                     frame_path = os.path.join(TEMP_DIR, frame_name)
                     cv2.imwrite(frame_path, frame)
-
                     paths_buffer.append(frame_path)
                     timestamps_buffer.append(current_time_sec)
-
                     if len(paths_buffer) >= batch_size:
-                        # Pass alert history to batch processor
                         batch_detections = self._process_batch(
-                            paths_buffer, 
-                            timestamps_buffer, 
-                            country, 
-                            min_confidence,
-                            video_alert_history 
+                            paths_buffer, timestamps_buffer, country, min_confidence, video_alert_history 
                         )
                         all_detections.extend(batch_detections)
-                        
-                        # Cleanup
                         for p in paths_buffer:
                             if os.path.exists(p): os.remove(p)
                         paths_buffer = []
                         timestamps_buffer = []
-                        
                         print(f"⏳ Progress: {frame_count/total_frames:.1%}")
-
                 frame_count += 1
-
-            # Process remaining
             if paths_buffer:
                 batch_detections = self._process_batch(
-                    paths_buffer, 
-                    timestamps_buffer, 
-                    country, 
-                    min_confidence, 
-                    video_alert_history
+                    paths_buffer, timestamps_buffer, country, min_confidence, video_alert_history
                 )
                 all_detections.extend(batch_detections)
                 for p in paths_buffer:
                     if os.path.exists(p): os.remove(p)
-
         finally:
             cap.release()
-
         print(f"✅ Video processing complete. Found {len(all_detections)} detections.")
         return all_detections
 
     def _process_batch(self, filepaths, timestamps, country, min_confidence, alert_history):
         if not self.model_manager.model: return []
-        
         try:
             path_to_time = {fp: ts for fp, ts in zip(filepaths, timestamps)}
-            
-            result = self.model_manager.model.predict(
-                filepaths=filepaths,
-                country=country,
-                batch_size=len(filepaths)
-            )
-            
+            result = self.model_manager.model.predict(filepaths=filepaths, country=country, batch_size=len(filepaths))
             valid_detections = []
             predictions = result.get('predictions', {})
-
             if isinstance(predictions, list):
                 iterator = zip(filepaths, predictions)
                 is_dict = False
             elif isinstance(predictions, dict):
                 iterator = predictions.items()
                 is_dict = True
-            else:
-                return []
-
+            else: return []
             for item in iterator:
                 path_key, pred_data = item if not is_dict else item
                 if not pred_data: continue
-                
                 class_data = pred_data.get("classifications", {})
                 if not class_data: continue
-
                 top_score = class_data.get("scores", [0])[0]
-
                 if top_score >= min_confidence:
                     top_class = class_data.get("classes", ["Unknown"])[0]
-                    
                     if ";" in top_class:
                         parts = [p.strip() for p in top_class.split(";") if p.strip()]
                         common_name = parts[-1].title()
                     else:
                         common_name = top_class.title()
-
                     time_sec = path_to_time.get(path_key, 0)
-                    
-                    # Save Permanent Image
                     unique_name = f"det_{uuid.uuid4().hex[:8]}.jpg"
                     save_path = os.path.join(DETECTIONS_DIR, unique_name)
-
                     if os.path.exists(path_key):
                         img = cv2.imread(path_key)
                         if img is not None:
@@ -265,37 +204,23 @@ class BatchVideoProcessor:
                                 img = cv2.resize(img, (640, int(h * scale)))
                             cv2.imwrite(save_path, img)
                             image_url = f"/static/detections/{unique_name}"
-                            
-                            # ==========================================
-                            # 🔔 UNIQUE ANIMAL ALERT LOGIC
-                            # ==========================================
-                            # Alert if High Confidence AND (First time seen OR >30s since last alert)
                             if top_score > 0.75:
                                 last_alert = alert_history.get(common_name, -999)
-                                
                                 if (time_sec - last_alert) > 30:
                                     msg = f"🐾 *WILDLIFE SIGHTING*\n\n🦁 *Species:* {common_name}\n🎯 *Confidence:* {top_score:.1%}\n⏱️ *Video Time:* {int(time_sec)}s"
                                     Thread(target=send_telegram_alert, args=(msg,)).start()
-                                    
-                                    # Update history for this species
                                     alert_history[common_name] = time_sec
-                            # ==========================================
-
-                        else:
-                            image_url = None
-                    else:
-                        image_url = None
-
+                        else: image_url = None
+                    else: image_url = None
                     valid_detections.append({
-                        "species": common_name,
-                        "confidence": float(top_score),
-                        "timestamp": time_sec,
-                        "image_url": image_url
+                        "species": common_name, "confidence": float(top_score),
+                        "timestamp": time_sec, "image_url": image_url
                     })
             return valid_detections
         except Exception as e:
             print(f"❌ Batch error: {e}")
             return []
+
 # ==========================================
 # 4. MODEL MANAGER
 # ==========================================
@@ -314,12 +239,9 @@ class ModelManager:
 
     def initialize(self):
         if self.initialized: return True
-        
         if not os.path.exists(MODEL_FOLDER):
             print(f"❌ MODEL NOT FOUND AT: {MODEL_FOLDER}")
             return False
-        
-        # Check for specific files inside the folder
         required_file = os.path.join(MODEL_FOLDER, "info.json")
         if not os.path.exists(required_file):
              print(f"❌ ERROR: 'info.json' not found inside {MODEL_FOLDER}")
@@ -333,12 +255,7 @@ class ModelManager:
 
         try:
             from speciesnet import SpeciesNet
-            self.model = SpeciesNet(
-                model_name=MODEL_FOLDER,
-                components='all',
-                geofence=True,
-                multiprocessing=False 
-            )
+            self.model = SpeciesNet(model_name=MODEL_FOLDER, components='all', geofence=True, multiprocessing=False)
             print("✅ Model Loaded Successfully")
             self._warmup()
             self.initialized = True
@@ -360,17 +277,10 @@ class ModelManager:
         except Exception as e:
             print(f"⚠️ Warmup failed: {e}")
             
-    # Helper to predict single file (used by detect endpoint)
     def predict(self, filepath):
         if not self.model: return None
         try:
-            return self.model.predict(
-                filepaths=[filepath],
-                country="IND",
-                run_mode='single_thread',
-                batch_size=1,
-                progress_bars=False
-            )
+            return self.model.predict(filepaths=[filepath], country="IND", run_mode='single_thread', batch_size=1, progress_bars=False)
         except Exception as e:
             print(f"Prediction Error: {e}")
             return None
@@ -378,7 +288,7 @@ class ModelManager:
 model_manager = ModelManager()
 
 # ==========================================
-# 5. ROUTES & UTILS
+# 5. ROUTES, GLOBALS & MQTT SETUP
 # ==========================================
 last_status = {
     "motion": 0, "tilt": 0.0, "gunshot": 0, "temp": None,
@@ -386,6 +296,61 @@ last_status = {
 }
 last_seen = 0
 gunshot_timestamp = 0
+
+# --- NEW: MQTT CLIENT LOGIC ---
+def on_mqtt_connect(client, userdata, flags, rc):
+    print(f"✅ Connected to MQTT Broker with result code {rc}")
+    # Subscribe to the topics the ESP32 is publishing to
+    client.subscribe([("security/events", 0), ("security/heartbeat", 0)])
+
+def on_mqtt_message(client, userdata, msg):
+    global last_status, last_seen, gunshot_timestamp, sensor_alert_history
+    current_time = time.time()
+    last_seen = current_time
+
+    try:
+        payload = msg.payload.decode('utf-8')
+        data = json.loads(payload)
+        
+        # Only print events to avoid spamming the terminal with heartbeats every 60s
+        if msg.topic == "security/events":
+            print(f"📨 ESP Event [{msg.topic}]: {data}")
+
+        # Update Dashboard Status globally
+        for k in last_status:
+            if k in data:
+                last_status[k] = data[k]
+                if k == "gunshot" and data[k] == 1: 
+                    gunshot_timestamp = current_time
+
+        # --- EVENT ALERT LOGIC ---
+        if msg.topic == "security/events":
+            # A. MOTION
+            if data.get('motion') == 1:
+                if (current_time - sensor_alert_history['motion']) > SENSOR_COOLDOWN:
+                    msg_text = f"🏃 *MOTION DETECTED* 🏃\n\n⏱️ *Time:* {datetime.now().strftime('%H:%M:%S')}\n📍 *Unit:* Field Cam 01"
+                    Thread(target=send_telegram_alert, args=(msg_text,)).start()
+                    sensor_alert_history['motion'] = current_time
+
+            # B. TILT (> 30°)
+            tilt_val = data.get('tilt', 0.0)
+            if tilt_val > 30:
+                if (current_time - sensor_alert_history['tilt']) > SENSOR_COOLDOWN:
+                    msg_text = f"⚠️ *DEVICE TILT WARNING* ⚠️\n\n📉 *Angle:* {tilt_val}°\n📍 *Unit:* Field Cam 01\nCheck mounting immediately."
+                    Thread(target=send_telegram_alert, args=(msg_text,)).start()
+                    sensor_alert_history['tilt'] = current_time
+
+            # C. GUNSHOT
+            if data.get('gunshot') == 1:
+                if (current_time - sensor_alert_history['gunshot']) > 2:
+                    msg_text = f"🔥 *GUNSHOT DETECTED* 🔥\n\n⏱️ *Time:* {datetime.now().strftime('%H:%M:%S')}\n📍 *Unit:* Field Cam 01\n*IMMEDIATE ACTION REQUIRED*"
+                    Thread(target=send_telegram_alert, args=(msg_text,)).start()
+                    sensor_alert_history['gunshot'] = current_time
+
+    except Exception as e:
+        print(f"❌ MQTT Error: {e}")
+
+# ----------------------------------------------
 
 def handle_amb82_video(video_file, sample_fps=1, min_conf=0.5, country='IND'):
     filename = secure_filename(f"amb82_{int(time.time())}.mp4")
@@ -402,22 +367,14 @@ def handle_amb82_video(video_file, sample_fps=1, min_conf=0.5, country='IND'):
         video_processor = BatchVideoProcessor(model_manager)
 
     try:
-        detections = video_processor.process_video_batched(
-            file_path, batch_size=8, sample_fps=sample_fps,
-            min_confidence=min_conf, country=country
-        )
-
+        detections = video_processor.process_video_batched(file_path, batch_size=8, sample_fps=sample_fps, min_confidence=min_conf, country=country)
         if detections:
             for d in detections:
                 res = DetectionResult(
-                    video_id=new_video.id,
-                    species=d['species'],
-                    confidence=d['confidence'],
-                    timestamp_in_video=d['timestamp'],
-                    image_url=d.get('image_url')
+                    video_id=new_video.id, species=d['species'], confidence=d['confidence'],
+                    timestamp_in_video=d['timestamp'], image_url=d.get('image_url')
                 )
                 db.session.add(res)
-        
         new_video.processed = True
         db.session.commit()
         return {"success": True, "video_id": new_video.id, "count": len(detections), "results": detections}
@@ -434,60 +391,34 @@ def sen(): return render_template('sensor.html')
 @app.route('/field_unit')
 def amb82_analysis(): return render_template('amb82_dashboard.html')
 
-# --- TEST ROUTE FOR SIMPLE FRONTEND ---
 @app.route('/test')
-def simple_test():
-    return render_template('simple_test.html')
+def simple_test(): return render_template('simple_test.html')
 
-## --- IMAGE DETECTION ENDPOINT (FIXED) ---
 @app.route('/api/detect', methods=['POST'])
 def detect():
     try:
         data = request.json
         img_data = data.get('image')
         if not img_data: return jsonify(success=False, error="No image data"), 400
+        if "," in img_data: _, encoded = img_data.split(",", 1)
+        else: encoded = img_data
+        try: binary = base64.b64decode(encoded)
+        except Exception: return jsonify(success=False, error="Invalid image encoding"), 400
         
-        # 1. Decode base64 image
-        if "," in img_data:
-            _, encoded = img_data.split(",", 1)
-        else:
-            encoded = img_data
-            
-        try:
-            binary = base64.b64decode(encoded)
-        except Exception:
-            return jsonify(success=False, error="Invalid image encoding"), 400
-        
-        # 2. Save temp file
         filename = f"upload_{uuid.uuid4().hex}.jpg"
         filepath = os.path.join(UPLOAD_DIR, filename)
-        
-        with open(filepath, "wb") as f: 
-            f.write(binary)
+        with open(filepath, "wb") as f: f.write(binary)
 
-        # 3. Run Inference
         if model_manager.model:
             result = model_manager.predict(filepath)
-            
-            # Clean up temp file immediately
             if os.path.exists(filepath): os.remove(filepath)
-            
             if result:
-                # Parse SpeciesNet result
                 predictions = result.get('predictions', {})
                 if not predictions: return jsonify(success=False, error="No predictions found"), 500
                 
-                # --- BUG FIX START ---
-                # Check if predictions is a List or a Dictionary
-                if isinstance(predictions, list):
-                    # It's a list, just take the first item
-                    pred_data = predictions[0]
-                elif isinstance(predictions, dict):
-                    # It's a dictionary, take the first value
-                    pred_data = next(iter(predictions.values()))
-                else:
-                    return jsonify(success=False, error="Unknown prediction format"), 500
-                # --- BUG FIX END ---
+                if isinstance(predictions, list): pred_data = predictions[0]
+                elif isinstance(predictions, dict): pred_data = next(iter(predictions.values()))
+                else: return jsonify(success=False, error="Unknown prediction format"), 500
                 
                 class_data = pred_data.get("classifications", {})
                 if not class_data: return jsonify(success=False, error="No classification data"), 500
@@ -495,7 +426,6 @@ def detect():
                 top_class = class_data.get("classes", ["Unknown"])[0]
                 top_score = class_data.get("scores", [0])[0]
 
-                # Parse scientific vs common name
                 if ";" in top_class:
                     parts = [p.strip() for p in top_class.split(";") if p.strip()]
                     species = parts[-1].title()
@@ -505,64 +435,13 @@ def detect():
                     scientific = top_class
 
                 return jsonify({
-                    "success": True, 
-                    "species": species,
-                    "scientific_name": scientific,
-                    "confidence": float(top_score)
+                    "success": True, "species": species, "scientific_name": scientific, "confidence": float(top_score)
                 })
-        
         return jsonify(success=False, error="Model failed to load"), 500
-
     except Exception as e:
-        print(f"❌ Detect Error: {e}")
-        # Print the full error to the terminal to help debug
         import traceback
         traceback.print_exc()
         return jsonify(success=False, error=str(e)), 500
-@app.route('/update', methods=['POST'])
-def update():
-    global last_status, last_seen, gunshot_timestamp
-    
-    data = request.json or {}
-    print(f"📨 ESP Data: {data}")
-    
-    current_time = time.time()
-    last_seen = current_time
-
-    # 1. Update Dashboard Status
-    for k in last_status:
-        if k in data:
-            last_status[k] = data[k]
-            if k == "gunshot" and data[k] == 1: 
-                gunshot_timestamp = current_time
-
-    # ==========================================
-    # 🚨 SENSOR ALERT LOGIC (Motion, Tilt, Gunshot)
-    # ==========================================
-    
-    # --- A. MOTION ALERT ---
-    if data.get('motion') == 1:
-        if (current_time - sensor_alert_history['motion']) > SENSOR_COOLDOWN:
-            msg = f"🏃 *MOTION DETECTED* 🏃\n\n⏱️ *Time:* {datetime.now().strftime('%H:%M:%S')}\n📍 *Unit:* Field Cam 01"
-            Thread(target=send_telegram_alert, args=(msg,)).start()
-            sensor_alert_history['motion'] = current_time
-
-    # --- B. TILT ALERT (> 30°) ---
-    tilt_val = data.get('tilt', 0.0)
-    if tilt_val > 30:
-        if (current_time - sensor_alert_history['tilt']) > SENSOR_COOLDOWN:
-            msg = f"⚠️ *DEVICE TILT WARNING* ⚠️\n\n📉 *Angle:* {tilt_val}°\n📍 *Unit:* Field Cam 01\nCheck mounting immediately."
-            Thread(target=send_telegram_alert, args=(msg,)).start()
-            sensor_alert_history['tilt'] = current_time
-
-    # --- C. GUNSHOT ALERT ---
-    if data.get('gunshot') == 1:
-        if (current_time - sensor_alert_history['gunshot']) > 2:
-            msg = f"🔥 *GUNSHOT DETECTED* 🔥\n\n⏱️ *Time:* {datetime.now().strftime('%H:%M:%S')}\n📍 *Unit:* Field Cam 01\n*IMMEDIATE ACTION REQUIRED*"
-            Thread(target=send_telegram_alert, args=(msg,)).start()
-            sensor_alert_history['gunshot'] = current_time
-
-    return {"status": "ok"}
 
 @app.route('/status')
 def status():
@@ -582,61 +461,37 @@ def upload_video():
     
     country = request.form.get('country', 'IND')
     response_mode = request.args.get('mode', 'simple')
-    
     full_data = handle_amb82_video(video_file, country=country)
     
-    if response_mode == 'simple':
-        return jsonify({"success": True, "status": "Ack", "id": full_data.get('video_id')}), 200
-    else:
-        return jsonify(full_data), 200
+    if response_mode == 'simple': return jsonify({"success": True, "status": "Ack", "id": full_data.get('video_id')}), 200
+    else: return jsonify(full_data), 200
 
 @app.route('/api/history')
 def get_history():
-    # 1. Get all videos
     videos = VideoRecord.query.order_by(VideoRecord.upload_time.desc()).all()
     output = []
-
-    # --- CONFIGURATION (Single Source of Truth) ---
-    CONFIDENCE_THRESHOLD = 0.55  # 70%
-    TIME_GAP_THRESHOLD = 5       # 5 Seconds
+    CONFIDENCE_THRESHOLD = 0.55
+    TIME_GAP_THRESHOLD = 5
 
     for v in videos:
-        # Get all detections for this video
         raw_detections = v.detections
-        
-        # Sort by timestamp (critical for time filtering)
-        # We sort in Python to be safe, though DB often returns sorted
         raw_detections.sort(key=lambda x: x.timestamp_in_video)
-
         clean_detections = []
-        last_seen = {} # { 'Lion': 12.5, 'Zebra': 4.0 }
+        last_seen_dict = {}
 
         for d in raw_detections:
-            # A. Confidence Check
-            if d.confidence < CONFIDENCE_THRESHOLD:
-                continue
-
-            # B. Time/Clutter Check
-            last_time = last_seen.get(d.species, -999)
-            
+            if d.confidence < CONFIDENCE_THRESHOLD: continue
+            last_time = last_seen_dict.get(d.species, -999)
             if (d.timestamp_in_video - last_time) > TIME_GAP_THRESHOLD:
-                # Passes filters! Add to list.
                 clean_detections.append({
-                    "species": d.species,
-                    "confidence": d.confidence,
-                    "time": d.timestamp_in_video,
-                    "image_url": d.image_url
+                    "species": d.species, "confidence": d.confidence,
+                    "time": d.timestamp_in_video, "image_url": d.image_url
                 })
-                # Update last seen
-                last_seen[d.species] = d.timestamp_in_video
+                last_seen_dict[d.species] = d.timestamp_in_video
 
-        # Only add video to history if it actually has relevant detections
         if clean_detections:
             output.append({
-                "id": v.id, 
-                "filename": v.filename,
-                "time": v.upload_time, 
-                "detections": clean_detections
+                "id": v.id, "filename": v.filename, "time": v.upload_time, "detections": clean_detections
             })
             
     return jsonify(output)
@@ -655,11 +510,24 @@ if __name__ == '__main__':
     
     # Initialize Model
     model_manager.initialize()
+
+    # --- START MQTT CLIENT IN BACKGROUND ---
+    mqtt_client = mqtt.Client()
+    mqtt_client.on_connect = on_mqtt_connect
+    mqtt_client.on_message = on_mqtt_message
     
+    try:
+        # Connects to Mosquitto running on the exact same computer (localhost)
+        mqtt_client.connect("127.0.0.1", 1883, 60)
+        mqtt_client.loop_start() # Starts a background thread for MQTT
+    except Exception as e:
+        print(f"⚠️ Could not connect to MQTT Broker. Is Mosquitto running? Error: {e}")
+
     print(f"\n{'='*60}")
     print(f"🌐 LOCAL URL: http://127.0.0.1:5000")
     print(f"🌐 TEST URL:  http://127.0.0.1:5000/test")
     print(f"{'='*60}\n")
     
     # Start Flask Server
-app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True) 
+    # Note: debug=False prevents the app from starting twice and duplicating MQTT connections
