@@ -241,7 +241,7 @@ void uploadVideo() {
 
     client.setTimeout(20000);
     
-    // Connect via Standard HTTP (not SSL)
+    // Connect via Standard HTTP
     if (client.connect(host_buf, server_port)) {
         Serial.println("Connected to Server!");
     } else {
@@ -252,7 +252,6 @@ void uploadVideo() {
     file = fs.open(FILENAME);
     
     String boundary = "---AmebaBoundary";
-    // Adding "source" field as per reference code logic
     String head = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"source\"\r\n\r\namb82\r\n";
     head += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"video\"; filename=\"" + FILENAME + "\"\r\nContent-Type: video/mp4\r\n\r\n";
     String tail = "\r\n--" + boundary + "--\r\n";
@@ -272,29 +271,41 @@ void uploadVideo() {
     size_t bytesSent = 0;
     Serial.println("Uploading...");
 
+    // Blink Logic Variables
+    unsigned long previousMillis = 0;
+    const long blinkInterval = 200; 
+    bool ledState = LOW;
+
     while (file.available()) {
         size_t len = file.read(buf, sizeof(buf));
         client.write(buf, len);
         bytesSent += len;
+        
         if (bytesSent % 102400 == 0) Serial.print("."); 
+
+        // Non-blocking Blink Logic
+        unsigned long currentMillis = millis();
+        if (currentMillis - previousMillis >= blinkInterval) {
+            previousMillis = currentMillis;
+            ledState = !ledState;
+            digitalWrite(LED_RECORDING, ledState);
+        }
+
+        // --- THE FIX: Let the Wi-Fi driver catch its breath ---
+        delay(2); 
+        // ------------------------------------------------------
     }
     file.close();
     Serial.println("\nFile Sent.");
     client.print(tail);
     client.flush();
     
-    // Read response (Optional, helpful for debugging)
-    // while (client.connected() || client.available()) {
-    //    if (client.available()) {
-    //        String line = client.readStringUntil('\n');
-    //        Serial.println(line);
-    //    }
-    // }
+    // Ensure LED turns off after upload
+    digitalWrite(LED_RECORDING, LOW);
     
     client.stop();
     Serial.println("Upload Complete.");
 }
-
 // ================= MAIN SETUP =================
 
 void setup() {
