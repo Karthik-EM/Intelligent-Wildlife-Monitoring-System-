@@ -22,7 +22,7 @@ const int buttonPin = 4;
 const int wificonfig_button = 5;
 
 // --- NEW CONTROL PIN ---
-const int controlPin = 23; 
+const int controlPin = 26; 
 
 // I2S Microphone
 #define I2S_WS 15
@@ -104,15 +104,21 @@ const unsigned long MOTION_HOLD_TIME_MS = 5000;
 unsigned long lastRawMotionTime = 0;            
 bool serverMotionState = false;                 
 // -----------------------------------
+
 // --- NEW COOLDOWN VARIABLES ---
 const unsigned long EVENT_COOLDOWN_MS = 30000; 
-unsigned long lastEventSendTime = 0;           
+unsigned long lastEventSendTime = 0;     
+
 // Server
 char serverUrlBuffer[100];
 String serverUrl; 
 
 // Task Handle for Audio
 TaskHandle_t AudioTaskHandle;
+
+// --- MANUAL WAKE TRACKERS ---
+unsigned long manualWakeTimer = 0;
+bool isManualWakeActive = false;
 
 // ==========================================
 // FUNCTION PROTOTYPES
@@ -306,6 +312,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     else if (message == "OFF" || message == "0" || message == "LOW") {
       digitalWrite(controlPin, LOW);
       Serial.println("Action: Pin 23 turned LOW");
+    }
+    // --- NON-BLOCKING WAKE COMMAND ---
+    else if (message == "WAKE") {
+      Serial.println("Action: Manual Wake Pulse Started");
+      isManualWakeActive = true;
+      manualWakeTimer = millis(); // Start the stopwatch
+      digitalWrite(wake_up, HIGH);
+      // NEW: Send a response back to the server!
+      mqttClient.publish(topicEvents, "{\"manual_wake\":1}");
     }
   }
 }
@@ -535,7 +550,11 @@ void loop() {
   } else {
     mqttClient.loop(); // This line is what actually checks for incoming messages!
   }
-  
+  // --- NEW: CHECK IF PULSE IS DONE (100ms) ---
+  if (isManualWakeActive && (millis() - manualWakeTimer >= 100)) {
+      isManualWakeActive = false;
+      digitalWrite(wake_up, LOW); // Turn it off after 100ms
+  }
   // ---- 1. SYSTEM HEARTBEAT ----
   handleHeartbeat();
 
@@ -639,7 +658,10 @@ void loop() {
     motion_status = serverMotionState ? 1 : 0; 
     bool anyEventActive = (motion_status == 1) || (gunshotDetected == true);
 
-    digitalWrite(wake_up, anyEventActive ? HIGH : LOW);
+    // Only let sensors control the pin if a manual pulse isn't happening
+    if (!isManualWakeActive) {
+        digitalWrite(wake_up, anyEventActive ? HIGH : LOW);
+    }
 
     if (gunshotDetected) {
        gunshotDetected = false; 
