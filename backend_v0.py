@@ -42,7 +42,8 @@ ROBOFLOW_API_KEY = os.getenv('ROBOFLOW_API_KEY')
 # --- Trackers to prevent notification spam ---
 sensor_alert_history = {"motion": 0, "tilt": 0, "gunshot": 0}
 SENSOR_COOLDOWN = 5  # Wait 5 seconds before repeating sensor alerts
-
+# confidence
+WEAPON_CONFIDENCE_THRESHOLD = 0.30
 # --- Define Folder Paths ---
 BASE_DIR = os.getcwd()
 MODEL_FOLDER = os.path.join(BASE_DIR, "speciesnet_model")
@@ -161,7 +162,7 @@ class ModelManager:
             
             # 2. Load Weapon Model to CPU
             print("⏳ Loading Weapon Model...")
-            self.weapon_model = get_model(model_id="rifle-1b8vx/1", api_key=ROBOFLOW_API_KEY)
+            self.weapon_model = get_model(model_id="rifle-1b8vx/2", api_key=ROBOFLOW_API_KEY)
             print("✅ Weapon Model Loaded Successfully (CPU)")
             
             self._warmup()
@@ -329,7 +330,7 @@ class BatchVideoProcessor:
                                 print(f"👤 Human spotted at {time_sec:.1f}s. Running Weapon Scan on CPU...")
                                 
                                 # Run inference on the Intel i5 CPU
-                                weapon_res = self.model_manager.weapon_model.infer(img, confidence=0.5)
+                                weapon_res = self.model_manager.weapon_model.infer(img,confidence=WEAPON_CONFIDENCE_THRESHOLD)
                                 
                                 # If weapon found...
                                 if len(weapon_res[0].predictions) > 0:
@@ -372,18 +373,19 @@ class BatchVideoProcessor:
                                     alert_history[common_name] = time_sec
                     # Log the original SpeciesNet detection to the database
                    # Log the original SpeciesNet detection to the database (excluding blanks)
-                    if common_name.lower() not in ["blank", "unknown", "none"]:
-                        valid_detections.append({
-                            "species": common_name, "confidence": float(top_score),
-                            "timestamp": time_sec, "image_url": image_url
-                        })
-                    
-                    # Inject an extra high-priority log into the DB so the dashboard shows "ARMED HUMAN" in red
+                    # If it's a human WITH a weapon, completely override the normal human log
                     if is_weapon_threat:
                         valid_detections.append({
                             "species": "ARMED HUMAN", "confidence": weapon_conf,
                             "timestamp": time_sec, "image_url": image_url
                         })
+                    else:
+                        # Log normal wildlife and unarmed humans
+                        if common_name.lower() not in ["blank", "unknown", "none"]:
+                            valid_detections.append({
+                                "species": common_name, "confidence": float(top_score),
+                                "timestamp": time_sec, "image_url": image_url
+                            })
 
             return valid_detections
         except Exception as e:
@@ -509,7 +511,7 @@ def handle_amb82_video(video_file, sample_fps=1, min_conf=0.5, country='IND', ro
 
         for d in raw_detections:
             # Rule 1: Confidence Check
-            if d['confidence'] < CONFIDENCE_THRESHOLD: 
+            if d['confidence'] < CONFIDENCE_THRESHOLD and d['species'] != "ARMED HUMAN": 
                 continue
             
             # Rule 2: Spam Prevention (5-second gap per species)
@@ -630,7 +632,7 @@ def detect():
                     
                     try:
                         # Run Weapon Model on Intel i5
-                        weapon_res = model_manager.weapon_model.infer(img, confidence=0.5)
+                        weapon_res = model_manager.weapon_model.infer(img,confidence=WEAPON_CONFIDENCE_THRESHOLD)
                         
                         # Debug Print 2: See how many weapons the CPU found
                         print(f"🎯 Weapon scan complete. Found {len(weapon_res[0].predictions)} threats.")
