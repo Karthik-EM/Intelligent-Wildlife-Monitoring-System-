@@ -112,7 +112,48 @@ body {
 .dot { width: 8px; height: 8px; background: #ccc; border-radius: 50%; position: relative; }
 .dot.active::after { content:''; position: absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:100%; height:100%; border:2px solid currentColor; border-radius:50%; animation: pulse 1.5s infinite; }
 @keyframes pulse { 0% { transform:translate(-50%,-50%) scale(0.8); opacity:0.8; } 100% { transform:translate(-50%,-50%) scale(2.5); opacity:0; } }
-    </style>
+  /* ========== WAKE BUTTON STYLES ========== */
+.btn-wake {
+    padding: 8px 20px;
+    background: #1a1a1a;
+    color: #fff;
+    border: 2px solid #1a1a1a;
+    border-radius: 50px;
+    font-family: inherit;
+    font-weight: 700;
+    font-size: 0.9rem;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+    outline: none;
+}
+
+/* When the mouse is over it */
+.btn-wake:hover {
+    background: #333;
+    transform: translateY(-2px);
+    box-shadow: 0 6px 15px rgba(0,0,0,0.15);
+}
+
+/* When you physically click and hold the mouse button down */
+.btn-wake:active {
+    transform: translateY(2px) scale(0.95);
+    box-shadow: inset 0 4px 8px rgba(0,0,0,0.4);
+    background: #000;
+}
+
+/* For when it is waiting for the backend */
+.btn-wake.loading {
+    background: #666;
+    border-color: #666;
+    pointer-events: none; /* Prevents double-clicking */
+    transform: none;
+    box-shadow: none;
+}  
+</style>
      
 </head>
 
@@ -131,11 +172,16 @@ body {
     <div class="dashboard-wrapper">
         
         <div class="sensor-panel">
-            <div class="header-area">
+<div class="header-area">
                 <div class="brand">
                     <h1>SentryNet</h1>
                     <p>Command Center</p>
                 </div>
+                
+                <button id="wakeBtn" class="btn-wake" onclick="wakeCamera()">
+                    <span>📷</span> Wake Camera
+                </button>
+                
                 <div class="global-status">
                     <div class="dot" id="global-dot"></div>
                     <span id="global-text">Initializing...</span>
@@ -367,6 +413,43 @@ function addLog(msg, type, customTime = null) {
             updateCard('espBox', 'offline', 'Error', 'Server Unreachable');
         }
     }
+    // --- Send WAKE Command to Backend ---
+// --- Send WAKE Command to Backend ---
+    async function wakeCamera() {
+        const btn = document.getElementById('wakeBtn');
+        const originalHTML = '<span>📷</span> Wake Camera';
+        
+        try {
+            // 1. Change UI to loading state
+            btn.classList.add('loading');
+            btn.innerHTML = '<span>⏳</span> Sending...';
+            addLog("Sending manual wake command...", "ok");
+            
+            // 2. Send the request
+            const res = await fetch('/api/command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ command: 'WAKE' })
+            });
+            const data = await res.json();
+            if(!data.success) throw new Error(data.error);
+
+            // 3. Show Success
+            btn.innerHTML = '<span>✅</span> Sent!';
+            
+        } catch (e) {
+            console.error(e);
+            addLog("Failed to send wake command", "danger");
+            // Show Error
+            btn.innerHTML = '<span>❌</span> Failed';
+        }
+
+        // 4. Reset the button back to normal after 2 seconds
+        setTimeout(() => {
+            btn.classList.remove('loading');
+            btn.innerHTML = originalHTML;
+        }, 2000);
+    }
 // --- Load History from Database ---
     async function loadLogHistory() {
         try {
@@ -391,6 +474,9 @@ function addLog(msg, type, customTime = null) {
                     } else if (event.type === "gunshot") {
                         msg = "CRITICAL: GUNSHOT DETECTED";
                         type = "danger";
+                    }else if (event.type === "system" && event.value === 1.0) {
+                        msg = "Camera manually awakened";
+                        type = "ok";
                     }
 
                     addLog(msg, type, event.timestamp);
