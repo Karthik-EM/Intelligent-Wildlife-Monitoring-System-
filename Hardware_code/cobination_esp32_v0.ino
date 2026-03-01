@@ -357,10 +357,19 @@ void reconnectMQTT() {
 // HELPER: Send Data (Events) -> MQTT
 // ==========================================
 void sendData(bool isGunshotEvent) {
-  if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
+  // 1. LED check: ONLY cares about WiFi status
+  if (WiFi.status() == WL_CONNECTED) {
      digitalWrite(wifi_on, HIGH);
-     digitalWrite(wifi_off, 0);
+     digitalWrite(wifi_off, LOW); // Green ON, Red OFF
+  } else {
+     digitalWrite(wifi_on, LOW);
+     digitalWrite(wifi_off, HIGH); // Green OFF, Red ON
+     Serial.println("WiFi disconnected. Skipping send.");
+     return; // Stop running the function right here
+  }
 
+  // 2. Data check: ONLY try to send if MQTT is connected
+  if (mqttClient.connected()) {
      char payload[128];
      int gsFlag = isGunshotEvent ? 1 : 0;
      double r = isGunshotEvent ? gunshotRatio : 0.0;
@@ -378,7 +387,7 @@ void sendData(bool isGunshotEvent) {
         Serial.println("MQTT Publish Failed");
      }
   } else {
-     Serial.println("WiFi/MQTT disconnected. Skipping send.");
+     Serial.println("MQTT disconnected. Skipping send.");
   }
   
   if(isGunshotEvent) digitalWrite(ledPin, LOW); 
@@ -599,7 +608,15 @@ void loop() {
   unsigned long currentMillis = millis();
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis; 
-
+  // --- REAL-TIME LED STATUS CHECK (WIFI ONLY) ---
+    if (WiFi.status() == WL_CONNECTED) {
+        digitalWrite(wifi_on, HIGH);
+        digitalWrite(wifi_off, LOW);
+    } else {
+        digitalWrite(wifi_on, LOW);
+        digitalWrite(wifi_off, HIGH);
+    }
+    // ----------------------------------------------
     int motion1 = digitalRead(pirPin);
     int motion2 = digitalRead(rcwlPin);
     
