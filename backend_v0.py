@@ -465,20 +465,55 @@ def handle_amb82_video(video_file, sample_fps=1, min_conf=0.5, country='IND', ro
         video_processor = BatchVideoProcessor(model_manager)
 
     try:
-        detections = video_processor.process_video_batched(
+        # 1. Get the raw, unfiltered detections from the AI
+        raw_detections = video_processor.process_video_batched(
             file_path, batch_size=2, sample_fps=sample_fps, 
             min_confidence=min_conf, country=country, rotate_video=rotate_video
         )
-        if detections:
-            for d in detections:
+        
+        # ==========================================
+        # 🚀 THE "SMART FILTER" PIPELINE
+        # ==========================================
+        CONFIDENCE_THRESHOLD = 0.55
+        TIME_GAP_THRESHOLD = 5
+
+        clean_detections = []
+        last_seen_dict = {}
+
+        # Ensure they are in chronological order
+        raw_detections.sort(key=lambda x: x['timestamp'])
+
+        for d in raw_detections:
+            # Rule 1: Confidence Check
+            if d['confidence'] < CONFIDENCE_THRESHOLD: 
+                continue
+            
+            # Rule 2: Spam Prevention (5-second gap per species)
+            last_time = last_seen_dict.get(d['species'], -999)
+            if (d['timestamp'] - last_time) > TIME_GAP_THRESHOLD:
+                clean_detections.append(d)
+                last_seen_dict[d['species']] = d['timestamp']
+
+        # Rule 3: Empty Video Purge (Only save if clean_detections has items)
+        if clean_detections:
+            for d in clean_detections:
                 res = DetectionResult(
                     video_id=new_video.id, species=d['species'], confidence=d['confidence'],
                     timestamp_in_video=d['timestamp'], image_url=d.get('image_url')
                 )
                 db.session.add(res)
+                
         new_video.processed = True
         db.session.commit()
-        return {"success": True, "video_id": new_video.id, "count": len(detections), "results": detections}
+        
+        # Send ONLY the clean data to the UI
+        return {
+            "success": True, 
+            "video_id": new_video.id, 
+            "count": len(clean_detections), 
+            "results": clean_detections
+        }
+        
     except Exception as e:
         print(f"❌ Error: {e}")
         return {"success": False, "error": str(e)}
@@ -651,31 +686,30 @@ def get_history():
     """Endpoint to fetch past detections for the dashboard."""
     videos = VideoRecord.query.order_by(VideoRecord.upload_time.desc()).all()
     output = []
-    CONFIDENCE_THRESHOLD = 0.55
-    TIME_GAP_THRESHOLD = 5
 
     for v in videos:
-        raw_detections = v.detections
-        raw_detections.sort(key=lambda x: x.timestamp_in_video)
-        clean_detections = []
-        last_seen_dict = {}
-
-        for d in raw_detections:
-            if d.confidence < CONFIDENCE_THRESHOLD: continue
+        # Since we did the "Empty Video Purge" during upload, 
+        # any video with 0 detections in the DB can just be skipped
+        if not v.detections: 
+            continue
             
-            # Condense detections so we don't show 5 pictures of the same deer
-            last_time = last_seen_dict.get(d.species, -999)
-            if (d.timestamp_in_video - last_time) > TIME_GAP_THRESHOLD:
-                clean_detections.append({
-                    "species": d.species, "confidence": d.confidence,
-                    "time": d.timestamp_in_video, "image_url": d.image_url
-                })
-                last_seen_dict[d.species] = d.timestamp_in_video
+        # Sort the already-clean detections chronologically
+        sorted_detections = sorted(v.detections, key=lambda x: x.timestamp_in_video)
+        
+        # Format the data for the UI
+        clean_detections = [{
+            "species": d.species, 
+            "confidence": d.confidence,
+            "time": d.timestamp_in_video, 
+            "image_url": d.image_url
+        } for d in sorted_detections]
 
-        if clean_detections:
-            output.append({
-                "id": v.id, "filename": v.filename, "time": v.upload_time, "detections": clean_detections
-            })
+        output.append({
+            "id": v.id, 
+            "filename": v.filename, 
+            "time": v.upload_time, 
+            "detections": clean_detections
+        })
             
     return jsonify(output)
 
