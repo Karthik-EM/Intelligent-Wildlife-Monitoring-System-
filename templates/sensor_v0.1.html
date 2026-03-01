@@ -123,7 +123,7 @@ body {
     <span class="divider">//</span>
     <a href="{{ url_for('sen') }}" class="mode-link active">Sensor Status</a>
      <span class="divider">//</span>
-    <a href="{{ url_for('amb82_analysis') }}" class="mode-link">Field View</a>
+    <a href="{{ url_for('amb82_analysis') }}" class="mode-link">Vedio Analysis</a>
 </div>
 
 
@@ -245,25 +245,28 @@ body {
         if(valEl) valEl.textContent = value;
         if(metaEl) metaEl.textContent = meta;
     }
-
-    function addLog(msg, type) {
+        //log function for events
+function addLog(msg, type, customTime = null) {
         const feed = document.getElementById('log-feed');
         if (!feed) return;
 
         const div = document.createElement('div');
         div.className = `log-entry log-${type}`;
         
-        const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+        const dateObj = customTime ? new Date(customTime) : new Date();
+        
+        // Force the browser to get the Date and Time separately
+        const dateStr = dateObj.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+        const timeStr = dateObj.toLocaleTimeString('en-US', { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
         
         div.innerHTML = `
-            <span class="log-time">${time}</span>
+            <span class="log-time">${dateStr} • ${timeStr}</span>
             <span class="log-msg">${msg}</span>
         `;
         
         feed.prepend(div);
         if(feed.children.length > 50) feed.lastElementChild.remove();
     }
-
     // --- Main Update Loop ---
     async function updateStatus() {
         try {
@@ -364,11 +367,45 @@ body {
             updateCard('espBox', 'offline', 'Error', 'Server Unreachable');
         }
     }
+// --- Load History from Database ---
+    async function loadLogHistory() {
+        try {
+            const res = await fetch("/api/sensor_history");
+            const data = await res.json();
+            
+            if (data.success && data.events) {
+                // Reverse the array so we prepend the oldest first, 
+                // leaving the absolute newest event at the very top of the UI
+                const reversedEvents = data.events.reverse();
 
+                reversedEvents.forEach(event => {
+                    let msg = "";
+                    let type = "ok";
+
+                    if (event.type === "motion") {
+                        msg = "Motion detected at perimeter";
+                        type = "warn";
+                    } else if (event.type === "tilt") {
+                        msg = `Tilt Alert: ${Number(event.value).toFixed(1)}°`;
+                        type = "warn";
+                    } else if (event.type === "gunshot") {
+                        msg = "CRITICAL: GUNSHOT DETECTED";
+                        type = "danger";
+                    }
+
+                    addLog(msg, type, event.timestamp);
+                });
+            }
+        } catch (e) {
+            console.error("Failed to load history:", e);
+        }
+    }
     // Start Loop
-    addLog("Dashboard initialized. Waiting for data...", "ok");
-    setInterval(updateStatus, 1000); // Poll every 1 second
-    updateStatus(); // Run once immediately
+    loadLogHistory().then(() => {
+        addLog("Dashboard initialized. Live polling started.", "ok");
+        setInterval(updateStatus, 1000); // Poll every 1 second
+        updateStatus(); // Run once immediately
+    });
 </script>
 </body>
 </html>
