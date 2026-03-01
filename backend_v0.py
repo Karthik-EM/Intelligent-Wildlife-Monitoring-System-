@@ -463,6 +463,10 @@ def on_mqtt_message(client, userdata, msg):
                     Thread(target=send_telegram_alert, args=(msg_text,)).start()
                     log_event_to_db("gunshot") # Save to DB
                     sensor_alert_history['gunshot'] = current_time
+            # 4. MANUAL WAKE ACKNOWLEDGMENT
+            if data.get('manual_wake') == 1:
+                log_event_to_db("system", value=1.0) # Logging as a system event
+                print("✅ Received ACK: Camera manually awakened by user.")
 
     except Exception as e:
         print(f"❌ MQTT Error: {e}")
@@ -756,6 +760,20 @@ def serve_video(filename): return send_from_directory(VIDEO_DIR, filename)
 @app.route('/static/detections/<path:filename>')
 def serve_detections(filename): return send_from_directory(DETECTIONS_DIR, filename)
 
+# command sending for esp
+@app.route('/api/command', methods=['POST'])
+def send_command():
+    """Endpoint for the UI to send commands to the ESP32 via MQTT."""
+    try:
+        data = request.json
+        command = data.get('command')
+        if command:
+            # Publish to the exact topic the ESP32 is subscribed to
+            mqtt_client.publish("security/command", command)
+            return jsonify({"success": True, "message": f"Sent {command} to ESP32"})
+        return jsonify({"success": False, "error": "No command provided"}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 # ==========================================
 # 6. MAIN SERVER EXECUTION
 # ==========================================
@@ -782,4 +800,4 @@ if __name__ == '__main__':
     print(f"{'='*60}\n")
     
     # 3. Start the Flask web server
-    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=False)
