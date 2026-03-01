@@ -26,7 +26,6 @@ from threading import Lock, Thread
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 from dotenv import load_dotenv
-
 # AI Model imports
 from inference import get_model
 
@@ -111,6 +110,12 @@ class DetectionResult(db.Model):
     confidence = db.Column(db.Float, nullable=False)
     timestamp_in_video = db.Column(db.Float, nullable=False)
     image_url = db.Column(db.String(255), nullable=True)
+class SensorEvent(db.Model):
+    """Database table to store ESP32 hardware sensor alerts."""
+    id = db.Column(db.Integer, primary_key=True)
+    event_type = db.Column(db.String(50), nullable=False)  # e.g., 'motion', 'tilt', 'gunshot'
+    value = db.Column(db.Float, nullable=True)             # e.g., the specific tilt angle
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
 
 # Create the database file if it doesn't exist
 with app.app_context(): db.create_all()
@@ -409,6 +414,14 @@ def on_mqtt_message(client, userdata, msg):
     current_time = time.time()
     last_seen = current_time
 
+    # Helper function to save to DB from a background thread
+    def log_event_to_db(event_type, value=None):
+        with app.app_context():
+            new_event = SensorEvent(event_type=event_type, value=value)
+            db.session.add(new_event)
+            db.session.commit()
+            print(f"💾 Logged {event_type.upper()} event to database.")
+
     try:
         payload = msg.payload.decode('utf-8')
         data = json.loads(payload)
@@ -423,25 +436,32 @@ def on_mqtt_message(client, userdata, msg):
                 if k == "gunshot" and data[k] == 1: 
                     gunshot_timestamp = current_time
 
-        # Sensor-specific Telegram alerts
+        # Sensor-specific logic and logging
         if msg.topic == "security/events":
+            
+            # 1. MOTION
             if data.get('motion') == 1:
                 if (current_time - sensor_alert_history['motion']) > SENSOR_COOLDOWN:
                     msg_text = f"🏃 *MOTION DETECTED* 🏃\n\n⏱️ *Time:* {datetime.now().strftime('%H:%M:%S')}\n📍 *Unit:* Field Cam 01"
                     Thread(target=send_telegram_alert, args=(msg_text,)).start()
+                    log_event_to_db("motion") # Save to DB
                     sensor_alert_history['motion'] = current_time
 
+            # 2. TILT
             tilt_val = data.get('tilt', 0.0)
             if tilt_val > 30: # If camera falls off tree
                 if (current_time - sensor_alert_history['tilt']) > SENSOR_COOLDOWN:
                     msg_text = f"⚠️ *DEVICE TILT WARNING* ⚠️\n\n📉 *Angle:* {tilt_val}°\n📍 *Unit:* Field Cam 01\nCheck mounting immediately."
                     Thread(target=send_telegram_alert, args=(msg_text,)).start()
+                    log_event_to_db("tilt", tilt_val) # Save to DB with angle
                     sensor_alert_history['tilt'] = current_time
 
-            if data.get('gunshot') == 1: # Acoustic sensor trip
+            # 3. GUNSHOT
+            if data.get('gunshot') == 1: 
                 if (current_time - sensor_alert_history['gunshot']) > 1:
                     msg_text = f"🔥 *GUNSHOT DETECTED* 🔥\n\n⏱️ *Time:* {datetime.now().strftime('%H:%M:%S')}\n📍 *Unit:* Field Cam 01\n*IMMEDIATE ACTION REQUIRED*"
                     Thread(target=send_telegram_alert, args=(msg_text,)).start()
+                    log_event_to_db("gunshot") # Save to DB
                     sensor_alert_history['gunshot'] = current_time
 
     except Exception as e:
@@ -712,7 +732,23 @@ def get_history():
         })
             
     return jsonify(output)
-
+@app.route('/api/sensor_history')
+def get_sensor_history():
+    """Endpoint to fetch past sensor events for the dashboard log."""
+    try:
+        # Get the 50 most recent events from the database
+        events = SensorEvent.query.order_by(SensorEvent.timestamp.desc()).limit(50).all()
+        output = []
+        for e in events:
+            output.append({
+                "id": e.id,
+                "type": e.event_type,
+                "value": e.value,
+                "timestamp": e.timestamp.isoformat() + "Z" # Format as standard UTC string for JS
+            })
+        return jsonify({"success": True, "events": output})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
 # Static file servers for videos and images
 @app.route('/uploads/videos/<path:filename>')
 def serve_video(filename): return send_from_directory(VIDEO_DIR, filename)
@@ -746,4 +782,4 @@ if __name__ == '__main__':
     print(f"{'='*60}\n")
     
     # 3. Start the Flask web server
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
